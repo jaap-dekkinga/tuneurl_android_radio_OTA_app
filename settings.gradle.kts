@@ -21,3 +21,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "TuneURL Radio"
 include(":app")
+include(":tuneurl_sdk")
