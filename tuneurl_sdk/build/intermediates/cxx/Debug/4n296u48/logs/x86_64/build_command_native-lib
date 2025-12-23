@@ -1,0 +1,4 @@
+/Users/macbookpro/Library/Android/sdk/cmake/3.22.1/bin/ninja \
+  -C \
+  "/Users/macbookpro/jaap dakinga/tuneurl_sdk/.cxx/Debug/4n296u48/x86_64" \
+  native-lib

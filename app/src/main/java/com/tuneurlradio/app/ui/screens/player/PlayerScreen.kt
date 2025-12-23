@@ -546,25 +546,25 @@ private fun ControlButtons(
     ) {
         Box {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                IconButton(
-                    onClick = { showSleepMenu = true },
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier
-                        .background(Color.White.copy(alpha = 0.15f), RoundedCornerShape(24.dp))
-                        .padding(horizontal = 16.dp, vertical = 8.dp)
+                        .clip(RoundedCornerShape(24.dp))
+                        .background(Color.White.copy(alpha = 0.15f))
+                        .clickable { showSleepMenu = true }
+                        .padding(horizontal = 20.dp, vertical = 12.dp)
                 ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(
-                            imageVector = if (sleepTimerActive) Icons.Filled.Timer else Icons.Default.Timer,
-                            contentDescription = "Sleep Timer",
-                            tint = Color.White
-                        )
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text(
-                            text = "Sleep",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = Color.White
-                        )
-                    }
+                    Icon(
+                        imageVector = if (sleepTimerActive) Icons.Filled.Timer else Icons.Default.Timer,
+                        contentDescription = "Sleep Timer",
+                        tint = Color.White
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = "Sleep",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = Color.White
+                    )
                 }
                 
                 if (sleepTimerEndTime != null) {
@@ -634,25 +634,25 @@ private fun ControlButtons(
         }
 
         if (socialUrl != null) {
-            IconButton(
-                onClick = onShareClick,
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier
-                    .background(Color.White.copy(alpha = 0.15f), RoundedCornerShape(24.dp))
-                    .padding(horizontal = 16.dp, vertical = 8.dp)
+                    .clip(RoundedCornerShape(24.dp))
+                    .background(Color.White.copy(alpha = 0.15f))
+                    .clickable(onClick = onShareClick)
+                    .padding(horizontal = 20.dp, vertical = 12.dp)
             ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(
-                        imageVector = Icons.Default.Share,
-                        contentDescription = "Share",
-                        tint = Color.White
-                    )
-                    Spacer(modifier = Modifier.width(4.dp))
-                    Text(
-                        text = "Share",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = Color.White
-                    )
-                }
+                Icon(
+                    imageVector = Icons.Default.Share,
+                    contentDescription = "Share",
+                    tint = Color.White
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = "Share",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = Color.White
+                )
             }
         } else {
             Spacer(modifier = Modifier.width(48.dp))

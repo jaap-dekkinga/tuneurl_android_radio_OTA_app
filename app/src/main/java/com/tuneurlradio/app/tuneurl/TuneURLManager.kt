@@ -3,6 +3,7 @@ package com.tuneurlradio.app.tuneurl
 import android.content.Context
 import android.util.Log
 import com.dekidea.tuneurl.util.TuneURLManager as SDKTuneURLManager
+import com.tuneurlradio.app.R
 import com.tuneurlradio.app.data.local.SettingsDataStore
 import com.tuneurlradio.app.data.repository.EngagementsRepository
 import com.tuneurlradio.app.domain.model.Engagement
@@ -247,9 +248,9 @@ class TuneURLManager @Inject constructor(
         )
 
         val notification = androidx.core.app.NotificationCompat.Builder(context, "tuneurl_triggers")
-            .setSmallIcon(android.R.drawable.ic_dialog_info)
-            .setContentTitle(match.name)
-            .setContentText(match.description.ifEmpty { "Tap to view" })
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setContentTitle("New Turl!")
+            .setContentText(match.description.ifEmpty { "If you're interested, then click 'save'" })
             .setPriority(androidx.core.app.NotificationCompat.PRIORITY_HIGH)
             .setAutoCancel(true)
             .setContentIntent(pendingIntent)

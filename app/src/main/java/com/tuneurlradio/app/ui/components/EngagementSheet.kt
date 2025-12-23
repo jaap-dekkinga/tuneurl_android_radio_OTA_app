@@ -45,7 +45,7 @@ fun EngagementSheet(
     val showWebView = match.type == "open_page" || match.type == "save_page"
     val showCouponImage = match.type == "coupon"
     
-    val autoDismissDelay = if (BuildConfig.DEBUG) 5000L else 15000L
+    val autoDismissDelay = if (BuildConfig.DEBUG) 15000L else 15000L
 
     val hasRecordPermission = remember {
         ContextCompat.checkSelfPermission(

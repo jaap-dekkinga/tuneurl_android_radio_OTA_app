@@ -76,7 +76,7 @@ fun MainScreen(
                 navController = navController,
                 modifier = Modifier
                     .fillMaxSize()
-                    .padding(bottom = 60.dp),
+                    .padding(bottom = 72.dp),
                 onStationClick = { stationId ->
                     viewModel.handleIntent(MainIntent.SelectStation(stationId))
                 }
@@ -86,8 +86,7 @@ fun MainScreen(
                 modifier = Modifier
                     .fillMaxWidth()
                     .align(Alignment.BottomCenter)
-                    .offset(y = (-8).dp)
-                    .padding(horizontal = 12.dp),
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 MiniPlayerView(

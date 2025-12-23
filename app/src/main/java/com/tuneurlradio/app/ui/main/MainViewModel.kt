@@ -85,7 +85,8 @@ class MainViewModel @Inject constructor(
                         isPlaying = playerState.isPlaying,
                         playerState = playerState.playerState,
                         trackName = playerState.trackName,
-                        artistName = playerState.artistName
+                        artistName = playerState.artistName,
+                        volume = playerState.volume
                     )
                 }
             }
@@ -217,7 +218,6 @@ class MainViewModel @Inject constructor(
     }
 
     private fun setVolume(volume: Float) {
-        updateState { copy(volume = volume) }
         radioPlayerManager.setVolume(volume)
     }
 
