@@ -1,5 +1,6 @@
 package com.tuneurlradio.app.tuneurl
 
+import android.app.ActivityManager
 import android.content.Context
 import android.util.Log
 import com.dekidea.tuneurl.util.TuneURLManager as SDKTuneURLManager
@@ -25,7 +26,8 @@ data class TuneURLState(
     val isListening: Boolean = false,        // OTA (microphone) listening active
     val isStreamParsing: Boolean = false,    // Stream parsing active (when radio plays)
     val currentMatch: TuneURLMatch? = null,
-    val showEngagementSheet: Boolean = false
+    val showEngagementSheet: Boolean = false,
+    val isMatchOpen: Boolean = false         // Prevents duplicate matches (like iOS currentOpenMatchController)
 )
 
 /**
@@ -58,6 +60,11 @@ class TuneURLManager @Inject constructor(
 
     private val _state = MutableStateFlow(TuneURLState())
     val state: StateFlow<TuneURLState> = _state.asStateFlow()
+    
+    // Track recently shown match IDs to prevent duplicates (like iOS)
+    private val recentlyShownMatchIds = mutableSetOf<String>()
+    private var lastMatchTime = 0L
+    private val MATCH_COOLDOWN_MS = 30000L  // 30 second cooldown between same match
 
     init {
         Log.d(TAG, "TuneURLManager initialized")
@@ -193,6 +200,31 @@ class TuneURLManager @Inject constructor(
     }
 
     private fun handleMatch(match: TuneURLMatch, isOTA: Boolean) {
+        // Guard: Don't show if a match is already open (like iOS currentOpenMatchController check)
+        if (_state.value.isMatchOpen || _state.value.showEngagementSheet) {
+            Log.d(TAG, "A match is already open, ignoring new match: ${match.name}")
+            return
+        }
+        
+        // Guard: Don't show the same match within cooldown period
+        val currentTime = System.currentTimeMillis()
+        if (recentlyShownMatchIds.contains(match.id) && (currentTime - lastMatchTime) < MATCH_COOLDOWN_MS) {
+            Log.d(TAG, "Match ${match.id} was recently shown, ignoring duplicate")
+            return
+        }
+        
+        // Track this match
+        recentlyShownMatchIds.add(match.id)
+        lastMatchTime = currentTime
+        
+        // Clean up old match IDs (keep only recent ones)
+        if (recentlyShownMatchIds.size > 10) {
+            recentlyShownMatchIds.clear()
+            recentlyShownMatchIds.add(match.id)
+        }
+        
+        Log.d(TAG, "Processing new match: ${match.name}")
+        
         val engagement = match.toEngagement(if (isOTA) null else currentStationId)
 
         scope.launch {
@@ -208,15 +240,40 @@ class TuneURLManager @Inject constructor(
                 engagementsRepository.saveToHistory(engagement)
             }
 
-            val displayMode = settingsDataStore.engagementDisplayMode.first()
-            if (displayMode == com.tuneurlradio.app.domain.model.EngagementDisplayMode.NOTIFICATION) {
+            // Check if app is in background - always show notification in background
+            val isAppInBackground = !isAppInForeground()
+            Log.d(TAG, "App is in ${if (isAppInBackground) "BACKGROUND" else "FOREGROUND"}")
+            
+            if (isAppInBackground) {
+                // Always show notification when app is in background
+                Log.d(TAG, "Showing notification for background trigger")
                 showNotification(match)
             } else {
-                _state.value = _state.value.copy(
-                    currentMatch = match,
-                    showEngagementSheet = true
-                )
+                // App is in foreground - check display mode preference
+                val displayMode = settingsDataStore.engagementDisplayMode.first()
+                if (displayMode == com.tuneurlradio.app.domain.model.EngagementDisplayMode.NOTIFICATION) {
+                    showNotification(match)
+                } else {
+                    _state.value = _state.value.copy(
+                        currentMatch = match,
+                        showEngagementSheet = true,
+                        isMatchOpen = true
+                    )
+                }
             }
+        }
+    }
+    
+    /**
+     * Check if app is in foreground
+     */
+    private fun isAppInForeground(): Boolean {
+        val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+        val runningAppProcesses = activityManager.runningAppProcesses ?: return false
+
+        return runningAppProcesses.any { processInfo ->
+            processInfo.importance == ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND &&
+                    processInfo.processName == context.packageName
         }
     }
 
@@ -234,10 +291,13 @@ class TuneURLManager @Inject constructor(
 
         val intent = android.content.Intent(context, Class.forName("com.tuneurlradio.app.MainActivity")).apply {
             flags = android.content.Intent.FLAG_ACTIVITY_NEW_TASK or android.content.Intent.FLAG_ACTIVITY_SINGLE_TOP
+            action = "com.tuneurlradio.app.SHOW_ENGAGEMENT"
             putExtra("match_id", match.id)
             putExtra("match_name", match.name)
+            putExtra("match_description", match.description)
             putExtra("match_info", match.info)
             putExtra("match_type", match.type)
+            putExtra("match_percentage", match.matchPercentage)
         }
 
         val pendingIntent = android.app.PendingIntent.getActivity(
@@ -262,7 +322,23 @@ class TuneURLManager @Inject constructor(
     fun dismissEngagement() {
         _state.value = _state.value.copy(
             showEngagementSheet = false,
-            currentMatch = null
+            currentMatch = null,
+            isMatchOpen = false  // Allow new matches after dismissal
+        )
+    }
+    
+    /**
+     * Show engagement sheet from notification click
+     * Called when user taps on a TuneURL notification
+     */
+    fun showEngagementFromNotification(match: TuneURLMatch) {
+        Log.d(TAG, "Showing engagement from notification: ${match.name}")
+        
+        // Reset any existing match state
+        _state.value = _state.value.copy(
+            currentMatch = match,
+            showEngagementSheet = true,
+            isMatchOpen = true
         )
     }
 

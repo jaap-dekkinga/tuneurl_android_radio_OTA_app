@@ -47,6 +47,7 @@ sealed interface MainIntent {
     data object DismissEngagement : MainIntent
     data class RecordInterest(val action: String) : MainIntent
     data class SetSleepTimer(val durationSeconds: Int?) : MainIntent
+    data class ShowEngagementFromNotification(val match: TuneURLMatch) : MainIntent
 }
 
 sealed interface MainEffect {
@@ -127,6 +128,7 @@ class MainViewModel @Inject constructor(
             MainIntent.DismissEngagement -> dismissEngagement()
             is MainIntent.RecordInterest -> recordInterest(intent.action)
             is MainIntent.SetSleepTimer -> setSleepTimer(intent.durationSeconds)
+            is MainIntent.ShowEngagementFromNotification -> showEngagementFromNotification(intent.match)
         }
     }
 
@@ -196,6 +198,14 @@ class MainViewModel @Inject constructor(
     }
 
     private fun dismissEngagement() {
+        // Clear local state
+        updateState { 
+            copy(
+                showEngagementSheet = false,
+                currentMatch = null
+            )
+        }
+        // Also clear TuneURLManager state
         tuneURLManager.dismissEngagement()
     }
 
@@ -203,6 +213,14 @@ class MainViewModel @Inject constructor(
         currentState.currentMatch?.let { match ->
             tuneURLManager.recordInterest(match, action)
         }
+        // Clear local state
+        updateState { 
+            copy(
+                showEngagementSheet = false,
+                currentMatch = null
+            )
+        }
+        // Also clear TuneURLManager state
         tuneURLManager.dismissEngagement()
     }
 
@@ -215,6 +233,21 @@ class MainViewModel @Inject constructor(
 
     private fun collapsePlayer() {
         updateState { copy(expandedPlayer = false) }
+    }
+
+    /**
+     * Show engagement sheet from notification click
+     */
+    private fun showEngagementFromNotification(match: TuneURLMatch) {
+        // Update state directly to show engagement sheet immediately
+        // This bypasses TuneURLManager to ensure the sheet shows
+        updateState { 
+            copy(
+                expandedPlayer = true,
+                currentMatch = match,
+                showEngagementSheet = true
+            ) 
+        }
     }
 
     private fun setVolume(volume: Float) {

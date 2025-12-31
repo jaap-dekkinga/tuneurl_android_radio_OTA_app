@@ -31,7 +31,7 @@ class TuneURLDetector(private val context: Context) : Constants {
 
     private val DETECTION_INTERVAL_MS = 500L
     private val FINGERPRINT_SAMPLE_RATE = 10240
-    private val CONTINUOUS_FINGERPRINT_INTERVAL_MS = 10000L
+    private val CONTINUOUS_FINGERPRINT_INTERVAL_MS = 2000L  // Match iOS: 2 seconds
     private val MIN_MATCH_PERCENTAGE = 25f
 
     private var lastFingerprintTime = 0L

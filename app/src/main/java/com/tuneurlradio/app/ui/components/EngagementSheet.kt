@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.util.Log
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.compose.foundation.layout.*
@@ -29,6 +30,8 @@ import com.tuneurlradio.app.voice.VoiceCommandManager
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
+private const val TAG = "EngagementSheet"
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun EngagementSheet(
@@ -53,53 +56,93 @@ fun EngagementSheet(
             Manifest.permission.RECORD_AUDIO
         ) == PackageManager.PERMISSION_GRANTED
     }
+    
+    // Check if voice recognition is available
+    val isVoiceAvailable by voiceCommandManager?.isVoiceAvailable?.collectAsState() ?: remember { mutableStateOf(false) }
+    val isActivelyListening by voiceCommandManager?.isActivelyListening?.collectAsState() ?: remember { mutableStateOf(false) }
+    
+    // Track if action was taken to prevent auto-dismiss after voice command
+    var actionTaken by remember { mutableStateOf(false) }
+    
+    // Determine if voice commands can be used
+    val canUseVoice = voiceCommandsEnabled && hasRecordPermission && isVoiceAvailable
 
+    // Auto-dismiss timer
     LaunchedEffect(Unit) {
         delay(autoDismissDelay)
-        onDismiss()
-    }
-
-    LaunchedEffect(voiceCommandsEnabled, hasRecordPermission) {
-        if (voiceCommandsEnabled && hasRecordPermission && voiceCommandManager != null) {
-            voiceCommandManager.startRecognition()
+        if (!actionTaken) {
+            Log.d(TAG, "Auto-dismissing engagement sheet after timeout")
+            onDismiss()
         }
     }
 
+    // Start voice recognition when sheet opens
+    LaunchedEffect(Unit) {
+        Log.d(TAG, "EngagementSheet opened - voiceCommandsEnabled=$voiceCommandsEnabled, hasRecordPermission=$hasRecordPermission, isVoiceAvailable=$isVoiceAvailable")
+        
+        if (canUseVoice && voiceCommandManager != null) {
+            // Small delay to let the sheet fully open
+            delay(500)
+            Log.d(TAG, "Starting voice recognition for engagement sheet")
+            voiceCommandManager.startRecognition()
+        } else {
+            if (!voiceCommandsEnabled) Log.d(TAG, "Voice commands disabled in settings")
+            if (!hasRecordPermission) Log.d(TAG, "No RECORD_AUDIO permission")
+            if (!isVoiceAvailable) Log.d(TAG, "Voice recognition not available on device")
+            if (voiceCommandManager == null) Log.d(TAG, "VoiceCommandManager is null")
+        }
+    }
+
+    // Stop voice recognition when sheet closes
     DisposableEffect(Unit) {
         onDispose {
+            Log.d(TAG, "EngagementSheet closing - stopping voice recognition")
             voiceCommandManager?.stopRecognition()
         }
     }
 
-    LaunchedEffect(voiceCommandManager) {
-        if (voiceCommandManager != null && voiceCommandsEnabled && hasRecordPermission) {
+    // Listen for voice commands
+    LaunchedEffect(Unit) {
+        if (voiceCommandManager != null && canUseVoice) {
+            Log.d(TAG, "Setting up voice command listener")
             voiceCommandManager.recognitions.collect { text ->
+                Log.d(TAG, "Voice command received: \"$text\"")
                 handleVoiceCommand(
                     text = text,
                     matchType = match.type,
                     matchInfo = match.info,
                     context = context,
                     onYesAction = {
+                        Log.d(TAG, "Voice command: YES action triggered")
+                        actionTaken = true
                         when (match.type) {
                             "open_page", "save_page", "coupon" -> onAction("interested")
                             "phone" -> {
                                 try {
                                     val intent = Intent(Intent.ACTION_DIAL, Uri.parse("tel:${match.info}"))
                                     context.startActivity(intent)
-                                } catch (e: Exception) {}
+                                } catch (e: Exception) {
+                                    Log.e(TAG, "Error opening phone", e)
+                                }
                                 onAction("acted")
                             }
                             "sms" -> {
                                 try {
                                     val intent = Intent(Intent.ACTION_VIEW, Uri.parse("sms:${match.info}"))
                                     context.startActivity(intent)
-                                } catch (e: Exception) {}
+                                } catch (e: Exception) {
+                                    Log.e(TAG, "Error opening SMS", e)
+                                }
                                 onAction("acted")
                             }
                             else -> onAction("interested")
                         }
                     },
-                    onNoAction = onDismiss
+                    onNoAction = {
+                        Log.d(TAG, "Voice command: NO action triggered")
+                        actionTaken = true
+                        onDismiss()
+                    }
                 )
             }
         }
@@ -125,6 +168,27 @@ fun EngagementSheet(
                     fontWeight = FontWeight.SemiBold,
                     textAlign = TextAlign.Center
                 )
+
+                Spacer(modifier = Modifier.height(8.dp))
+                
+                // Voice command indicator
+                if (voiceCommandsEnabled && hasRecordPermission) {
+                    if (isVoiceAvailable) {
+                        Text(
+                            text = if (isActivelyListening) "🎤 Listening... Say \"Yes\" or \"No\"" else "🎤 Say \"Yes\" or \"No\"",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = if (isActivelyListening) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                            textAlign = TextAlign.Center
+                        )
+                    } else {
+                        Text(
+                            text = "Voice commands unavailable",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            textAlign = TextAlign.Center
+                        )
+                    }
+                }
 
                 Spacer(modifier = Modifier.height(16.dp))
             }
@@ -293,15 +357,24 @@ private fun handleVoiceCommand(
     onNoAction: () -> Unit
 ) {
     val lowerText = text.lowercase()
+    Log.d(TAG, "Processing voice command: \"$lowerText\"")
     
     when {
         lowerText.contains("yes") || lowerText.contains("save") || 
-        lowerText.contains("call") || lowerText.contains("write") -> {
+        lowerText.contains("call") || lowerText.contains("write") ||
+        lowerText.contains("okay") || lowerText.contains("sure") ||
+        lowerText.contains("yeah") || lowerText.contains("yep") -> {
+            Log.d(TAG, "Matched YES command")
             onYesAction()
         }
         lowerText.contains("no") || lowerText.contains("dismiss") || 
-        lowerText.contains("close") || lowerText.contains("cancel") -> {
+        lowerText.contains("close") || lowerText.contains("cancel") ||
+        lowerText.contains("nope") || lowerText.contains("skip") -> {
+            Log.d(TAG, "Matched NO command")
             onNoAction()
+        }
+        else -> {
+            Log.d(TAG, "No matching command found for: \"$lowerText\"")
         }
     }
 }
