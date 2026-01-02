@@ -7,11 +7,11 @@ plugins {
 }
 
 android {
-    namespace = "com.tuneurlradio.app"
+    namespace = "com.tuneurl.KSALradioapp"
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "com.tuneurlradio.app"
+        applicationId = "com.tuneurl.KSALradioapp"
         minSdk = 26
         targetSdk = 36
         versionCode = 1
