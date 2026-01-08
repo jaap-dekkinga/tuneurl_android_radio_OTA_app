@@ -127,6 +127,7 @@ class MainActivity : ComponentActivity() {
                         com.tuneurlradio.app.ui.components.EngagementSheet(
                             match = state.currentMatch!!,
                             voiceCommandManager = mainViewModel.voiceCommandManager,
+                            tuneURLManager = mainViewModel.tuneURLManager,
                             voiceCommandsEnabled = state.voiceCommandsEnabled,
                             onDismiss = { mainViewModel.handleIntent(MainIntent.DismissEngagement) },
                             onAction = { action -> mainViewModel.handleIntent(MainIntent.RecordInterest(action)) }

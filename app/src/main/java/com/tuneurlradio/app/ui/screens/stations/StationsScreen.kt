@@ -4,12 +4,14 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
@@ -31,6 +33,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -69,8 +72,23 @@ fun StationsScreen(
         },
         containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f)
     ) { padding ->
+        val configuration = LocalConfiguration.current
+        val screenWidthDp = configuration.screenWidthDp
+        
+        // Calculate columns based on screen width
+        // Mobile (< 600dp): 2 columns
+        // Tablet (>= 600dp): adaptive based on screen width, min 160dp per card
+        val columns = if (screenWidthDp < 600) {
+            GridCells.Fixed(2)
+        } else {
+            GridCells.Adaptive(minSize = 160.dp)
+        }
+        
+        // Max card width to prevent oversized cards on tablets
+        val maxCardWidth = if (screenWidthDp >= 600) 200.dp else 300.dp
+        
         LazyVerticalGrid(
-            columns = GridCells.Fixed(2),
+            columns = columns,
             contentPadding = PaddingValues(16.dp),
             horizontalArrangement = Arrangement.spacedBy(16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp),
@@ -81,6 +99,7 @@ fun StationsScreen(
             items(state.stations, key = { it.id }) { station ->
                 StationCard(
                     station = station,
+                    maxWidth = maxCardWidth,
                     onClick = { viewModel.handleIntent(StationsIntent.StationClicked(station)) }
                 )
             }
@@ -91,12 +110,13 @@ fun StationsScreen(
 @Composable
 private fun StationCard(
     station: Station,
+    maxWidth: androidx.compose.ui.unit.Dp = 300.dp,
     onClick: () -> Unit
 ) {
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
         modifier = Modifier
-            .fillMaxWidth()
+            .widthIn(max = maxWidth)
             .clickable(onClick = onClick)
     ) {
         Card(

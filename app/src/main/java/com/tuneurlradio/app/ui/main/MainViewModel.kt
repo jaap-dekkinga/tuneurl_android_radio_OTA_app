@@ -58,7 +58,7 @@ sealed interface MainEffect {
 class MainViewModel @Inject constructor(
     private val stationsDataSource: StationsDataSource,
     private val radioPlayerManager: RadioPlayerManager,
-    private val tuneURLManager: TuneURLManager,
+    val tuneURLManager: TuneURLManager,
     private val settingsDataStore: SettingsDataStore,
     val voiceCommandManager: VoiceCommandManager
 ) : MviViewModel<MainState, MainIntent, MainEffect>(MainState()) {

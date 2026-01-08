@@ -54,11 +54,17 @@ class VoiceCommandManager @Inject constructor(
         val activities = context.packageManager.queryIntentActivities(intent, PackageManager.MATCH_DEFAULT_ONLY)
         val hasActivity = activities.isNotEmpty()
         
+        // On Android 11+ (API 30+), isRecognitionAvailable may return false due to package visibility
+        // restrictions even when speech recognition is actually available. We need the <queries>
+        // element in AndroidManifest.xml to properly detect availability.
+        // As a fallback, if we have the activity but isRecognitionAvailable is false,
+        // we still try to use speech recognition.
         _isVoiceAvailable.value = isAvailable || hasActivity
         
         Log.d(TAG, "Voice recognition availability check:")
         Log.d(TAG, "  - SpeechRecognizer.isRecognitionAvailable: $isAvailable")
         Log.d(TAG, "  - Has speech recognition activity: $hasActivity")
+        Log.d(TAG, "  - Android SDK: ${android.os.Build.VERSION.SDK_INT}")
         Log.d(TAG, "  - Final availability: ${_isVoiceAvailable.value}")
         
         if (!_isVoiceAvailable.value) {
@@ -66,6 +72,9 @@ class VoiceCommandManager @Inject constructor(
             Log.w(TAG, "  - Google app not installed")
             Log.w(TAG, "  - Running on emulator without Google Play Services")
             Log.w(TAG, "  - Speech recognition service disabled")
+            if (android.os.Build.VERSION.SDK_INT >= 30) {
+                Log.w(TAG, "  - Android 11+ package visibility: ensure <queries> is in AndroidManifest.xml")
+            }
         }
     }
 

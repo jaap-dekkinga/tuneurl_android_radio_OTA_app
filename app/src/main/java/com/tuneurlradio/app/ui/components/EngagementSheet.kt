@@ -25,6 +25,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import coil.compose.AsyncImage
 import com.tuneurlradio.app.BuildConfig
+import com.tuneurlradio.app.tuneurl.TuneURLManager
 import com.tuneurlradio.app.tuneurl.TuneURLMatch
 import com.tuneurlradio.app.voice.VoiceCommandManager
 import kotlinx.coroutines.delay
@@ -37,6 +38,7 @@ private const val TAG = "EngagementSheet"
 fun EngagementSheet(
     match: TuneURLMatch,
     voiceCommandManager: VoiceCommandManager?,
+    tuneURLManager: TuneURLManager?,
     voiceCommandsEnabled: Boolean,
     onDismiss: () -> Unit,
     onAction: (String) -> Unit
@@ -76,12 +78,18 @@ fun EngagementSheet(
         }
     }
 
-    // Start voice recognition when sheet opens
+    // Pause OTA listening and start voice recognition when sheet opens
+    // Like iOS: when engagement sheet opens, we need the microphone for voice commands
     LaunchedEffect(Unit) {
         Log.d(TAG, "EngagementSheet opened - voiceCommandsEnabled=$voiceCommandsEnabled, hasRecordPermission=$hasRecordPermission, isVoiceAvailable=$isVoiceAvailable")
         
         if (canUseVoice && voiceCommandManager != null) {
-            // Small delay to let the sheet fully open
+            // Pause OTA listening to free up the microphone for voice commands
+            // This matches iOS behavior where StateManager.shared.isListening is checked
+            Log.d(TAG, "Pausing OTA listening for voice commands")
+            tuneURLManager?.pauseOTAListeningForVoice()
+            
+            // Small delay to let the microphone be released by OTA listener
             delay(500)
             Log.d(TAG, "Starting voice recognition for engagement sheet")
             voiceCommandManager.startRecognition()
@@ -93,11 +101,12 @@ fun EngagementSheet(
         }
     }
 
-    // Stop voice recognition when sheet closes
+    // Stop voice recognition and resume OTA listening when sheet closes
     DisposableEffect(Unit) {
         onDispose {
             Log.d(TAG, "EngagementSheet closing - stopping voice recognition")
             voiceCommandManager?.stopRecognition()
+            // OTA listening will be resumed in TuneURLManager.dismissEngagement()
         }
     }
 

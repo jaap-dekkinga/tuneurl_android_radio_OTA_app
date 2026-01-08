@@ -350,6 +350,22 @@ class TuneURLDetector(private val context: Context) : Constants {
         try {
             Log.d(TAG, "Searching fingerprint via SDK...")
             Log.d(TAG, "Fingerprint length: ${fingerprint.length} chars")
+            
+            // Log the full fingerprint for debugging/curl testing
+            Log.d(TAG, "================================================")
+            Log.d(TAG, "FINGERPRINT FOR CURL TESTING:")
+            Log.d(TAG, "================================================")
+            // Split fingerprint into chunks for logcat (max ~4000 chars per log)
+            val chunkSize = 3500
+            fingerprint.chunked(chunkSize).forEachIndexed { index, chunk ->
+                Log.d(TAG, "FP_CHUNK_$index: $chunk")
+            }
+            Log.d(TAG, "================================================")
+            Log.d(TAG, "CURL COMMAND (combine FP_CHUNK_* above into one string):")
+            Log.d(TAG, "curl -X POST 'https://pnz3vadc52.execute-api.us-east-2.amazonaws.com/dev/search-fingerprint' \\")
+            Log.d(TAG, "  -H 'Content-Type: application/json' \\")
+            Log.d(TAG, "  -d '{\"fingerprint\": \"<PASTE_ALL_FP_CHUNKS_HERE>\"}'")
+            Log.d(TAG, "================================================")
 
             val intent = Intent(context, APIService::class.java).apply {
                 putExtra(Constants.TUNEURL_ACTION, Constants.ACTION_SEARCH_FINGERPRINT)

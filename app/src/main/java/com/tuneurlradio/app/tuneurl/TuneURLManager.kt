@@ -27,7 +27,8 @@ data class TuneURLState(
     val isStreamParsing: Boolean = false,    // Stream parsing active (when radio plays)
     val currentMatch: TuneURLMatch? = null,
     val showEngagementSheet: Boolean = false,
-    val isMatchOpen: Boolean = false         // Prevents duplicate matches (like iOS currentOpenMatchController)
+    val isMatchOpen: Boolean = false,        // Prevents duplicate matches (like iOS currentOpenMatchController)
+    val isOTAPausedForVoice: Boolean = false // OTA paused temporarily for voice commands
 )
 
 /**
@@ -325,7 +326,54 @@ class TuneURLManager @Inject constructor(
             currentMatch = null,
             isMatchOpen = false  // Allow new matches after dismissal
         )
+        
+        // Resume OTA listening if it was paused for voice commands
+        resumeOTAListeningAfterVoice()
     }
+    
+    /**
+     * Temporarily pause OTA listening to allow voice commands to use the microphone
+     * Called when engagement sheet opens and voice commands are enabled
+     * Like iOS behavior where StateManager.shared.isListening is checked
+     */
+    fun pauseOTAListeningForVoice() {
+        if (!_state.value.isListening) {
+            Log.d(TAG, "OTA not listening, no need to pause for voice")
+            return
+        }
+        
+        Log.d(TAG, "Pausing OTA listening for voice commands")
+        otaListener?.stopListening()
+        _state.value = _state.value.copy(
+            isListening = false,
+            isOTAPausedForVoice = true
+        )
+    }
+    
+    /**
+     * Resume OTA listening after voice commands are done
+     * Called when engagement sheet closes
+     */
+    fun resumeOTAListeningAfterVoice() {
+        if (!_state.value.isOTAPausedForVoice) {
+            Log.d(TAG, "OTA was not paused for voice, no need to resume")
+            return
+        }
+        
+        Log.d(TAG, "Resuming OTA listening after voice commands")
+        _state.value = _state.value.copy(isOTAPausedForVoice = false)
+        
+        // Only resume if radio is not playing
+        if (!_state.value.isStreamParsing) {
+            otaListener?.startListening()
+            _state.value = _state.value.copy(isListening = true)
+        }
+    }
+    
+    /**
+     * Check if OTA is currently listening (for voice command manager to know)
+     */
+    fun isOTAListening(): Boolean = _state.value.isListening
     
     /**
      * Show engagement sheet from notification click
