@@ -118,7 +118,9 @@ class MainActivity : ComponentActivity() {
                                 }
                             },
                             onSleepTimerSet = { duration ->
-                                mainViewModel.handleIntent(MainIntent.SetSleepTimer(duration))
+                                mainViewModel.handleIntent(MainIntent.SetSleepTimer(duration))                            },
+                            onBackClick = {
+                                mainViewModel.handleIntent(MainIntent.CollapsePlayer)
                             }
                         )
                     }
