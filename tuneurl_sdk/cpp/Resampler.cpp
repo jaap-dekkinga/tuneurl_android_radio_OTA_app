@@ -1,6 +1,35 @@
 #include "Resampler.h"
 #include <cmath>
 #include <algorithm>
+#include <vector>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+// Windowed sinc interpolation for high-quality resampling
+// This is similar to what iOS AVAudioEngine uses internally
+static inline double sincFunction(double x) {
+    if (std::abs(x) < 1e-8) {
+        return 1.0;
+    }
+    double pix = M_PI * x;
+    return std::sin(pix) / pix;
+}
+
+// Blackman window for better frequency response
+static inline double blackmanWindow(double x, double width) {
+    if (std::abs(x) >= width) {
+        return 0.0;
+    }
+    double n = x / width;
+    return 0.42 - 0.5 * std::cos(2.0 * M_PI * (n + 0.5)) + 0.08 * std::cos(4.0 * M_PI * (n + 0.5));
+}
+
+// Windowed sinc interpolation kernel
+static inline double windowedSinc(double x, double width) {
+    return sincFunction(x) * blackmanWindow(x, width);
+}
 
 Resampler::Resampler() 
     : mInputRate(0), mOutputRate(0), mChannels(1), mInitialized(false), mRatio(1.0) {
@@ -39,23 +68,47 @@ int Resampler::resample(const int16_t* input, int inputLength, int16_t* output, 
         outputLength = outputCapacity;
     }
     
-    // Linear interpolation resampling
+    // Windowed sinc interpolation with adaptive kernel width
+    // Kernel width: larger for downsampling, smaller for upsampling
+    const double kernelWidth = std::max(4.0, 8.0 / mRatio);
+    const int kernelSize = static_cast<int>(std::ceil(kernelWidth));
+    
     double step = static_cast<double>(inputLength - 1) / static_cast<double>(outputLength - 1);
     
     for (int i = 0; i < outputLength; i++) {
         double srcPos = i * step;
-        int srcIndex = static_cast<int>(srcPos);
-        double frac = srcPos - srcIndex;
+        int centerIndex = static_cast<int>(std::round(srcPos));
         
-        if (srcIndex >= inputLength - 1) {
-            output[i] = input[inputLength - 1];
-        } else {
-            // Linear interpolation between two samples
-            double sample = input[srcIndex] * (1.0 - frac) + input[srcIndex + 1] * frac;
-            // Clamp to int16 range
-            sample = std::max(-32768.0, std::min(32767.0, sample));
-            output[i] = static_cast<int16_t>(sample);
+        double sum = 0.0;
+        double weightSum = 0.0;
+        
+        // Apply windowed sinc filter
+        for (int j = -kernelSize; j <= kernelSize; j++) {
+            int sampleIndex = centerIndex + j;
+            
+            // Handle boundaries with mirroring for better quality
+            if (sampleIndex < 0) {
+                sampleIndex = -sampleIndex;
+            } else if (sampleIndex >= inputLength) {
+                sampleIndex = 2 * inputLength - sampleIndex - 2;
+            }
+            
+            // Clamp to valid range
+            sampleIndex = std::max(0, std::min(inputLength - 1, sampleIndex));
+            
+            double distance = srcPos - (centerIndex + j);
+            double weight = windowedSinc(distance, kernelWidth);
+            
+            sum += input[sampleIndex] * weight;
+            weightSum += weight;
         }
+        
+        // Normalize by weight sum to maintain amplitude
+        double sample = (weightSum > 1e-8) ? (sum / weightSum) : 0.0;
+        
+        // Clamp to int16 range
+        sample = std::max(-32768.0, std::min(32767.0, sample));
+        output[i] = static_cast<int16_t>(std::round(sample));
     }
     
     return outputLength;
