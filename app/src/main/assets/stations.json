@@ -1,22 +1,6 @@
 [
   {
     "id": 1,
-    "name": "TESTING: TuneURL Radio",
-    "streamURL": "http://libretime.tuneurl-demo.com:8000/main",
-    "imageURL": null,
-    "shortDescription": "Passive listening becomes interactive, measurable engagement",
-    "socialURL": "https://www.linkedin.com/company/tuneurl/"
-  },
-  {
-    "id": 2,
-    "name": "TESTING: RadioJar Station",
-    "streamURL": "https://n10.radiojar.com/vzv0nkgsw7uvv",
-    "imageURL": null,
-    "shortDescription": "Radio Jar Station",
-    "socialURL": "https://www.radiojar.com/"
-  },
-  {
-    "id": 3,
     "name": "KSAL Newsradio 1150",
     "streamURL": "https://ice23.securenetsystems.net/KSALAM",
     "imageURL": "https://cdnrf.securenetsystems.net/file_radio/stations_large/KSALAM/v5/album-art-default.png",
@@ -24,7 +8,7 @@
     "socialURL": "https://www.ksal.com/#"
   },
   {
-    "id": 4,
+    "id": 2,
     "name": "KYEZ",
     "streamURL": "https://ice23.securenetsystems.net/KYEZ",
     "imageURL": "https://cdnrf.securenetsystems.net/file_radio/stations_large/KYEZ/v5/logo.png",
@@ -32,7 +16,7 @@
     "socialURL": "https://www.ksal.com/#"
   },
   {
-    "id": 5,
+    "id": 3,
     "name": "KSALFM 104.9",
     "streamURL": "https://ice23.securenetsystems.net/KSALFM",
     "imageURL": "https://cdnrf.securenetsystems.net/file_radio/stations_large/KSALFM/v5/logo.png",
@@ -40,7 +24,7 @@
     "socialURL": "https://www.ksal.com/#"
   },
   {
-    "id": 6,
+    "id": 4,
     "name": "KABI",
     "streamURL": "https://ice42.securenetsystems.net/KABI",
     "imageURL": "https://cdnrf.securenetsystems.net/file_radio/stations_large/KABI/v5/logo.png",
