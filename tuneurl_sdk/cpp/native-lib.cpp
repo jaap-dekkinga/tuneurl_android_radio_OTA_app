@@ -7,11 +7,11 @@
 
 // JNI methods for TuneURLNative.kt
 extern "C" JNIEXPORT jbyteArray JNICALL
-Java_com_dekidea_tuneurl_TuneURLNative_extractFingerprint(JNIEnv* env, jobject /* this */, jobject byteBuffer, jint waveLength) {
+Java_com_dekidea_tuneurl_TuneURLNative_extractFingerprint(JNIEnv* env, jobject /* this */, jobject byteBuffer, jint waveLength, jint emitVersion) {
 
     int16_t* wave = (int16_t*) env->GetDirectBufferAddress(byteBuffer);
 
-    Fingerprint* fingerprint = ExtractFingerprint(wave, waveLength);
+    Fingerprint* fingerprint = ExtractFingerprint(wave, waveLength, emitVersion);
 
     jbyteArray result = (env)->NewByteArray(fingerprint->dataSize);
 
@@ -23,11 +23,11 @@ Java_com_dekidea_tuneurl_TuneURLNative_extractFingerprint(JNIEnv* env, jobject /
 }
 
 extern "C" JNIEXPORT jbyteArray JNICALL
-Java_com_dekidea_tuneurl_TuneURLNative_extractFingerprintFromRawFile(JNIEnv* env, jobject /* this */, jstring filePath) {
+Java_com_dekidea_tuneurl_TuneURLNative_extractFingerprintFromRawFile(JNIEnv* env, jobject /* this */, jstring filePath, jint emitVersion) {
 
     const char * _nativeString = env->GetStringUTFChars(filePath, 0);
 
-    Fingerprint* fingerprint = ExtractFingerprintFromRawFile(_nativeString);
+    Fingerprint* fingerprint = ExtractFingerprintFromRawFile(_nativeString, emitVersion);
 
     jbyteArray result = (env)->NewByteArray(fingerprint->dataSize);
 
@@ -41,15 +41,15 @@ Java_com_dekidea_tuneurl_TuneURLNative_extractFingerprintFromRawFile(JNIEnv* env
 }
 
 extern "C" JNIEXPORT jfloat JNICALL
-Java_com_dekidea_tuneurl_TuneURLNative_getSimilarity(JNIEnv* env, jobject /* this */, jobject byteBuffer1, jint waveLength1, jobject byteBuffer2, jint waveLength2) {
+Java_com_dekidea_tuneurl_TuneURLNative_getSimilarity(JNIEnv* env, jobject /* this */, jobject byteBuffer1, jint waveLength1, jobject byteBuffer2, jint waveLength2, jint emitVersion) {
 
     int16_t* wave1 = (int16_t*) env->GetDirectBufferAddress(byteBuffer1);
 
-    Fingerprint* fingerprint1 = ExtractFingerprint(wave1, waveLength1);
+    Fingerprint* fingerprint1 = ExtractFingerprint(wave1, waveLength1, emitVersion);
 
     int16_t* wave2 = (int16_t*) env->GetDirectBufferAddress(byteBuffer2);
 
-    Fingerprint* fingerprint2 = ExtractFingerprint(wave2, waveLength2);
+    Fingerprint* fingerprint2 = ExtractFingerprint(wave2, waveLength2, emitVersion);
 
     FingerprintSimilarity similarity = CompareFingerprints(fingerprint1, fingerprint2);
 
@@ -103,4 +103,3 @@ Java_com_dekidea_tuneurl_NativeResampler_nativeDestroy(JNIEnv* env, jobject /* t
         delete resampler;
     }
 }
-
