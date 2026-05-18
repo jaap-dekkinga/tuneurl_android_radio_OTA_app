@@ -7,6 +7,7 @@
 //
 
 
+#include <cstring>
 #include "ArrayCoord.h"
 #include "FingerprintManager.h"
 #include "FingerprintProperties.h"

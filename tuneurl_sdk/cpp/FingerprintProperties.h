@@ -28,6 +28,10 @@ public:
 	static int maxTargetZoneDistance;
 	static int numFrequencyUnits;
 
+	// R2: intensity tier packing
+	static int numIntensityTiers;
+	static int defaultHashProtocolVersion;
+
 };
 
 #endif /* FINGERPRINTPROPERTIES_H */

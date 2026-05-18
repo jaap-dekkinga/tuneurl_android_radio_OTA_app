@@ -9,6 +9,7 @@
 #ifndef FINGERPRINTMANAGER_H
 #define FINGERPRINTMANAGER_H
 
+#include <cstdint>
 #include <vector>
 #include "FingerprintProperties.h"
 
@@ -22,6 +23,9 @@ public:
 
 	vector<uint8_t> *extractFingerprint(const int16_t *wave, int waveLength);
 
+	void setHashProtocolVersion(int version) { hashProtocolVersion = version; }
+	int getHashProtocolVersion() const { return hashProtocolVersion; }
+
 private:
 
 	// robustLists[x] = y1, y2, y3, ...
@@ -31,6 +35,7 @@ private:
 
 	int numFilterBanks { FingerprintProperties::numFilterBanks };
 	float sampleRate { FingerprintProperties::sampleRate } ;
+	int hashProtocolVersion { 1 };
 
 };
 
