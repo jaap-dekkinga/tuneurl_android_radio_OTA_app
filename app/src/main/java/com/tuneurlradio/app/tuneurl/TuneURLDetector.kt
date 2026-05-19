@@ -47,9 +47,17 @@ class TuneURLDetector(private val context: Context) : Constants {
                 addAction(Constants.SEARCH_FINGERPRINT_RESULT_ERROR)
             }
 
+            // The result broadcast is sent by this app's own APIService and is
+            // not consumed by any other app. NOT_EXPORTED is the correct flag.
+            // On API < 33 the flag overload doesn't exist, so we fall back.
             if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
-                context.registerReceiver(searchResultReceiver, searchFilter, Context.RECEIVER_EXPORTED)
+                context.registerReceiver(
+                    searchResultReceiver,
+                    searchFilter,
+                    Context.RECEIVER_NOT_EXPORTED
+                )
             } else {
+                @Suppress("UnspecifiedRegisterReceiverFlag")
                 context.registerReceiver(searchResultReceiver, searchFilter)
             }
 
@@ -69,7 +77,12 @@ class TuneURLDetector(private val context: Context) : Constants {
         Log.d(TAG, "startDetection called")
         Log.d(TAG, "Stream URL: $streamUrl")
         Log.d(TAG, "================================================")
-        
+
+        // DIAG-V1-ROLLBACK: force v1 emission for server compatibility
+        // (the AWS search-fingerprint endpoint expects v1 fingerprints)
+        TuneURLSDK.setFormatVersion(1)
+        Log.i(TAG, "DIAG-V1-ROLLBACK: format version forced to v${TuneURLSDK.getFormatVersion()}")
+
         onMatchDetected = onMatch
         isDetecting = true
         currentStreamUrl = streamUrl
