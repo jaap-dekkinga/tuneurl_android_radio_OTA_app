@@ -15,7 +15,6 @@ import android.media.MediaRecorder
 import android.util.Log
 import androidx.core.content.ContextCompat
 import com.dekidea.tuneurl.NativeResampler
-import com.dekidea.tuneurl.TuneURLNative
 import com.dekidea.tuneurl.TuneURLSDK
 import com.dekidea.tuneurl.service.APIService
 import com.dekidea.tuneurl.util.Constants
@@ -371,7 +370,7 @@ class OTAListener(private val context: Context) : Constants {
                     val similarity = TuneURLSDK.calculateSimilarityAt(
                         resampledBuffer, capturedSampleCount,
                         triggerBuf, triggerSampleCount,
-                        TuneURLNative.FORMAT_VERSION_V2
+                        TuneURLSDK.FORMAT_VERSION_V2
                     )
 
                     Log.i(

@@ -11,7 +11,6 @@ import android.media.MediaFormat
 import android.util.Log
 import androidx.core.content.ContextCompat
 import com.dekidea.tuneurl.NativeResampler
-import com.dekidea.tuneurl.TuneURLNative
 import com.dekidea.tuneurl.TuneURLSDK
 import com.dekidea.tuneurl.service.APIService
 import com.dekidea.tuneurl.util.Constants
@@ -236,7 +235,7 @@ class TuneURLDetector(private val context: Context) : Constants {
                         val similarity = TuneURLSDK.calculateSimilarityAt(
                             resampledBuffer, sampleCount,
                             tBuf, tLen,
-                            TuneURLNative.FORMAT_VERSION_V2
+                            TuneURLSDK.FORMAT_VERSION_V2
                         )
                         // Restore position for the v1 fingerprint extraction
                         // below; calculateSimilarity advances the buffer.
