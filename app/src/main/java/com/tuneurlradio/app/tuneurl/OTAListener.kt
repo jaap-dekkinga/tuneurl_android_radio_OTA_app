@@ -15,6 +15,7 @@ import android.media.MediaRecorder
 import android.util.Log
 import androidx.core.content.ContextCompat
 import com.dekidea.tuneurl.NativeResampler
+import com.dekidea.tuneurl.TuneURLNative
 import com.dekidea.tuneurl.TuneURLSDK
 import com.dekidea.tuneurl.service.APIService
 import com.dekidea.tuneurl.util.Constants
@@ -361,14 +362,23 @@ class OTAListener(private val context: Context) : Constants {
                     resampledBuffer.rewind()
                     val capturedSampleCount = outputLength / 2
                     
-                    // Compare with trigger sound using SDK
+                    // Compare with trigger sound using SDK.
+                    // Use the explicit-version overload pinned to v2 — the local
+                    // trigger gate is a v2 feature and must NOT inherit whatever
+                    // the singleton was last set to (which can be v1 if the
+                    // stream path ran earlier in the session).
                     triggerBuf.rewind()
-                    val similarity = TuneURLSDK.calculateSimilarity(
+                    val similarity = TuneURLSDK.calculateSimilarityAt(
                         resampledBuffer, capturedSampleCount,
-                        triggerBuf, triggerSampleCount
+                        triggerBuf, triggerSampleCount,
+                        TuneURLNative.FORMAT_VERSION_V2
                     )
-                    
-                    Log.d(TAG, "Trigger similarity: ${(similarity * 100).toInt()}%")
+
+                    Log.i(
+                        "TuneURL_DIAG",
+                        "OTA local v2 similarity=%.4f (threshold=%.2f)"
+                            .format(similarity, TRIGGER_SIMILARITY_THRESHOLD)
+                    )
                     
                     if (similarity >= TRIGGER_SIMILARITY_THRESHOLD) {
                         Log.d(TAG, "================================================")

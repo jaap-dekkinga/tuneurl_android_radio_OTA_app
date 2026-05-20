@@ -11,11 +11,15 @@ import android.media.MediaFormat
 import android.util.Log
 import androidx.core.content.ContextCompat
 import com.dekidea.tuneurl.NativeResampler
+import com.dekidea.tuneurl.TuneURLNative
 import com.dekidea.tuneurl.TuneURLSDK
 import com.dekidea.tuneurl.service.APIService
 import com.dekidea.tuneurl.util.Constants
 import com.google.gson.JsonParser
+import com.tuneurlradio.app.R
 import kotlinx.coroutines.*
+import java.io.File
+import java.io.FileOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
@@ -33,6 +37,13 @@ class TuneURLDetector(private val context: Context) : Constants {
     private val FINGERPRINT_SAMPLE_RATE = 10240
     private val CONTINUOUS_FINGERPRINT_INTERVAL_MS = 2000L  // Match iOS: 2 seconds
     private val MIN_MATCH_PERCENTAGE = 25f
+
+    // Local v2 trigger gate. Mirrors iOS local detection (validated 6/6 on iOS).
+    // The gate runs v2 explicitly; the server fingerprint stays on v1. See
+    // v2_context_android.md / v2_architecture_android.md for the design.
+    private val TRIGGER_SIMILARITY_THRESHOLD = 0.10f  // Match iOS gate (0.1)
+    private var triggerBuffer: ByteBuffer? = null
+    private var triggerSampleCount = 0
 
     private var lastFingerprintTime = 0L
     private var recordingTuneURL = false
@@ -83,6 +94,13 @@ class TuneURLDetector(private val context: Context) : Constants {
         TuneURLSDK.setFormatVersion(1)
         Log.i(TAG, "DIAG-V1-ROLLBACK: format version forced to v${TuneURLSDK.getFormatVersion()}")
 
+        // Load the bundled trigger sound for the local v2 gate. The gate uses
+        // TuneURLSDK.calculateSimilarityAt(..., FORMAT_VERSION_V2) at the call
+        // site, so it is independent of the singleton version above.
+        if (triggerBuffer == null) {
+            loadTriggerSound()
+        }
+
         onMatchDetected = onMatch
         isDetecting = true
         currentStreamUrl = streamUrl
@@ -93,6 +111,7 @@ class TuneURLDetector(private val context: Context) : Constants {
         Log.d(TAG, "TuneURL detection started (using raw MP3 capture)")
         Log.d(TAG, "Detection interval: ${DETECTION_INTERVAL_MS}ms")
         Log.d(TAG, "Fingerprint interval: ${CONTINUOUS_FINGERPRINT_INTERVAL_MS}ms")
+        Log.d(TAG, "Local v2 trigger gate threshold: $TRIGGER_SIMILARITY_THRESHOLD")
     }
 
     fun stopDetection() {
@@ -202,6 +221,47 @@ class TuneURLDetector(private val context: Context) : Constants {
                     resampledBuffer.rewind()
                     val sampleCount = outputLength / 2
 
+                    // --- LOCAL v2 TRIGGER GATE -------------------------------
+                    // Compare the current stream window against the bundled
+                    // trigger sound, using v2 explicitly (does NOT touch the
+                    // singleton). Skip the server call when the gate is below
+                    // threshold. If the trigger asset failed to load we fall
+                    // through (treat as "gate passes") so we never silently
+                    // drop into a do-nothing state — the server flow is the
+                    // safety net.
+                    val tBuf = triggerBuffer
+                    val tLen = triggerSampleCount
+                    if (tBuf != null && tLen > 0) {
+                        tBuf.rewind()
+                        val similarity = TuneURLSDK.calculateSimilarityAt(
+                            resampledBuffer, sampleCount,
+                            tBuf, tLen,
+                            TuneURLNative.FORMAT_VERSION_V2
+                        )
+                        // Restore position for the v1 fingerprint extraction
+                        // below; calculateSimilarity advances the buffer.
+                        resampledBuffer.rewind()
+
+                        // DIAG line prescribed by v2_architecture_android.md §4.
+                        // Unconditional — this is THE log line the iOS effort
+                        // identified as the single most useful diagnostic.
+                        Log.i(
+                            "TuneURL_DIAG",
+                            "local v2 similarity=%.4f (threshold=%.2f) at t=%d"
+                                .format(similarity, TRIGGER_SIMILARITY_THRESHOLD, System.currentTimeMillis())
+                        )
+
+                        if (similarity < TRIGGER_SIMILARITY_THRESHOLD) {
+                            // No trigger in this window — don't bother the server.
+                            recordingTuneURL = false
+                            return@withContext
+                        }
+                        Log.d(TAG, "Local v2 gate PASSED (similarity=$similarity) — proceeding to server")
+                    } else {
+                        Log.w(TAG, "Trigger buffer not loaded — bypassing local gate this cycle")
+                    }
+                    // ---------------------------------------------------------
+
                     val fingerprintBytes = TuneURLSDK.extractFingerprintFromBuffer(resampledBuffer, sampleCount)
 
                     if (fingerprintBytes != null) {
@@ -230,6 +290,81 @@ class TuneURLDetector(private val context: Context) : Constants {
                 Log.e(TAG, "Error processing MP3 buffer: ${e.message}", e)
                 recordingTuneURL = false
             }
+        }
+    }
+
+    /**
+     * Load the bundled trigger sound (R.raw.trigger_sound, same asset as iOS),
+     * decode it, mix to mono, resample to FINGERPRINT_SAMPLE_RATE, and stash
+     * the resulting PCM in [triggerBuffer] for the local gate.
+     *
+     * The asset is the same MP3 used by OTAListener; we copy it through
+     * MediaCodec via the same pipeline as the stream so the decoded byte
+     * representation is consistent.
+     */
+    private fun loadTriggerSound() {
+        try {
+            Log.d(TAG, "Loading trigger sound for local v2 gate...")
+
+            val triggerFile = File(context.cacheDir, "trigger_sound_detector.mp3")
+            if (!triggerFile.exists()) {
+                context.resources.openRawResource(R.raw.trigger_sound).use { input ->
+                    FileOutputStream(triggerFile).use { output ->
+                        input.copyTo(output)
+                    }
+                }
+            }
+
+            val pcmData = decodeMp3ToPcm(triggerFile.absolutePath)
+            val sampleRate = getDecodedSampleRate(triggerFile.absolutePath)
+
+            if (pcmData == null || pcmData.isEmpty()) {
+                Log.e(TAG, "Failed to decode trigger sound — local gate will be bypassed")
+                return
+            }
+
+            val monoData = convertToMono(pcmData)
+
+            val sourceBuffer = ByteBuffer.allocateDirect(monoData.size)
+            sourceBuffer.order(ByteOrder.LITTLE_ENDIAN)
+            sourceBuffer.put(monoData)
+            sourceBuffer.rewind()
+
+            val resampledSize = ((FINGERPRINT_SAMPLE_RATE.toDouble() / sampleRate.toDouble()) * monoData.size).toInt()
+            val resampledBuffer = ByteBuffer.allocateDirect(resampledSize)
+            resampledBuffer.order(ByteOrder.LITTLE_ENDIAN)
+
+            val resampler = NativeResampler()
+            try {
+                resampler.create(sampleRate, FINGERPRINT_SAMPLE_RATE, 2048, 1)
+                val outputLength = resampler.resampleEx(
+                    sourceBuffer, resampledBuffer, sourceBuffer.remaining()
+                )
+
+                if (outputLength > 0) {
+                    resampledBuffer.rewind()
+                    resampledBuffer.limit(outputLength)
+
+                    val held = ByteBuffer.allocateDirect(outputLength)
+                    held.order(ByteOrder.LITTLE_ENDIAN)
+                    held.put(resampledBuffer)
+                    held.rewind()
+
+                    triggerBuffer = held
+                    triggerSampleCount = outputLength / 2
+
+                    Log.i(
+                        TAG,
+                        "✓ Trigger sound loaded: $triggerSampleCount samples at $FINGERPRINT_SAMPLE_RATE Hz"
+                    )
+                } else {
+                    Log.e(TAG, "Trigger resample produced 0 bytes — local gate will be bypassed")
+                }
+            } finally {
+                resampler.destroy()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error loading trigger sound — local gate will be bypassed", e)
         }
     }
 
