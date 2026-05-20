@@ -225,42 +225,52 @@ class TuneURLManager @Inject constructor(
         }
         
         Log.d(TAG, "Processing new match: ${match.name}")
-        
+
         val engagement = match.toEngagement(if (isOTA) null else currentStationId)
 
+        // Show the modal/notification ASAP. Read the display-mode preference inside
+        // a coroutine (it's a suspending DataStore read), then update state immediately.
+        // Bookkeeping (record-of-interest, saveToHistory) is fire-and-forget below so
+        // it doesn't gate the UI.
         scope.launch {
-            SDKTuneURLManager.addRecordOfInterest(
-                context,
-                match.id,
-                "heard",
-                match.date ?: ""
-            )
-
-            val storeHistory = settingsDataStore.storeHistory.first()
-            if (storeHistory && engagement.canSave) {
-                engagementsRepository.saveToHistory(engagement)
-            }
-
-            // Check if app is in background - always show notification in background
             val isAppInBackground = !isAppInForeground()
             Log.d(TAG, "App is in ${if (isAppInBackground) "BACKGROUND" else "FOREGROUND"}")
-            
+
             if (isAppInBackground) {
-                // Always show notification when app is in background
                 Log.d(TAG, "Showing notification for background trigger")
                 showNotification(match)
             } else {
-                // App is in foreground - check display mode preference
                 val displayMode = settingsDataStore.engagementDisplayMode.first()
                 if (displayMode == com.tuneurlradio.app.domain.model.EngagementDisplayMode.NOTIFICATION) {
                     showNotification(match)
                 } else {
+                    Log.d(TAG, "Showing engagement sheet for match: ${match.name}")
                     _state.value = _state.value.copy(
                         currentMatch = match,
                         showEngagementSheet = true,
                         isMatchOpen = true
                     )
                 }
+            }
+        }
+
+        // Fire-and-forget bookkeeping: record-of-interest server call + history save.
+        // These run after the modal is already visible so they don't gate the UI.
+        scope.launch {
+            try {
+                SDKTuneURLManager.addRecordOfInterest(
+                    context,
+                    match.id,
+                    "heard",
+                    match.date ?: ""
+                )
+
+                val storeHistory = settingsDataStore.storeHistory.first()
+                if (storeHistory && engagement.canSave) {
+                    engagementsRepository.saveToHistory(engagement)
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Bookkeeping failed for match ${match.id}", e)
             }
         }
     }
