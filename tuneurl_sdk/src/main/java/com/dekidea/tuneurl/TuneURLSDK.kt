@@ -148,6 +148,44 @@ object TuneURLSDK {
     }
 
     /**
+     * Calculate similarity between two audio buffers using an EXPLICIT format
+     * version, ignoring the SDK's current singleton setting. Use this when a
+     * caller needs a specific version for one call (e.g. local v2 trigger gate
+     * while the rest of the app is on v1). Mismatched versions between the two
+     * buffers cannot happen here — both fingerprints in a single call always
+     * use the same version (the JNI layer enforces this).
+     *
+     * Returns -1.0 on a Kotlin-level error, 0.0..1.0 otherwise.
+     */
+    fun calculateSimilarityAt(
+        buffer1: ByteBuffer,
+        length1: Int,
+        buffer2: ByteBuffer,
+        length2: Int,
+        version: Int
+    ): Float {
+        if (!isInitialized) {
+            Log.e(TAG, "SDK not initialized")
+            return -1.0f
+        }
+        require(
+            version == TuneURLNative.FORMAT_VERSION_V1 ||
+                version == TuneURLNative.FORMAT_VERSION_V2
+        ) { "Unsupported format version: $version" }
+
+        return try {
+            val similarity = TuneURLNative.getSimilarity(
+                buffer1, length1, buffer2, length2, version
+            )
+            Log.d(TAG, "Similarity (explicit v$version): raw=%.4f".format(similarity))
+            similarity
+        } catch (e: Exception) {
+            Log.e(TAG, "Error calculating similarity (explicit v$version)", e)
+            -1.0f
+        }
+    }
+
+    /**
      * Convert fingerprint ByteArray to hex string for API transmission
      */
     fun fingerprintToHexString(fingerprint: ByteArray): String {
