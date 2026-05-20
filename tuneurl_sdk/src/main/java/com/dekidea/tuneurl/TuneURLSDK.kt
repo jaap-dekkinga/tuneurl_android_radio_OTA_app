@@ -18,6 +18,14 @@ object TuneURLSDK {
     private const val TAG = "TuneURLSDK"
     private var isInitialized = false
 
+    /**
+     * Format version constants re-exported from TuneURLNative (which is
+     * `internal` and not visible outside the SDK module). Use these at call
+     * sites in the app module instead of TuneURLNative.FORMAT_VERSION_V*.
+     */
+    const val FORMAT_VERSION_V1: Int = TuneURLNative.FORMAT_VERSION_V1
+    const val FORMAT_VERSION_V2: Int = TuneURLNative.FORMAT_VERSION_V2
+
     @Volatile
     private var formatVersion: Int = TuneURLNative.FORMAT_VERSION_V2
 
