@@ -80,21 +80,16 @@ fun EngagementSheet(
         }
     }
 
-    // Pause OTA listening and start voice recognition when sheet opens
-    // Like iOS: when engagement sheet opens, we need the microphone for voice commands
+    // Log when sheet opens. Voice recognition is NOT auto-started anymore:
+    // SpeechRecognizer requests audio focus, which causes ExoPlayer to duck/pause the
+    // radio stream, and the recognizer also auto-restarts on emulator failures
+    // ("not connected to the recognition service") creating modal instability.
+    // To re-enable voice commands, add an explicit user-triggered button that calls
+    // tuneURLManager?.pauseOTAListeningForVoice() then voiceCommandManager.startRecognition().
     LaunchedEffect(Unit) {
         Log.d(TAG, "EngagementSheet opened - voiceCommandsEnabled=$voiceCommandsEnabled, hasRecordPermission=$hasRecordPermission, isVoiceAvailable=$isVoiceAvailable")
-        
         if (canUseVoice && voiceCommandManager != null) {
-            // Pause OTA listening to free up the microphone for voice commands
-            // This matches iOS behavior where StateManager.shared.isListening is checked
-            Log.d(TAG, "Pausing OTA listening for voice commands")
-            tuneURLManager?.pauseOTAListeningForVoice()
-            
-            // Small delay to let the microphone be released by OTA listener
-            delay(500)
-            Log.d(TAG, "Starting voice recognition for engagement sheet")
-            voiceCommandManager.startRecognition()
+            Log.d(TAG, "Voice commands available but auto-start disabled to protect audio focus")
         } else {
             if (!voiceCommandsEnabled) Log.d(TAG, "Voice commands disabled in settings")
             if (!hasRecordPermission) Log.d(TAG, "No RECORD_AUDIO permission")
@@ -198,8 +193,11 @@ fun EngagementSheet(
 
             if (match.type != "poll") {
                 Spacer(modifier = Modifier.height(8.dp))
-                
-                // Voice command indicator
+
+                // Voice command indicator — hidden because voice recognition no longer
+                // auto-starts on modal open. If a user-triggered voice button is added
+                // later, re-enable this block (gated on whether the user opted in).
+                /*
                 if (voiceCommandsEnabled && hasRecordPermission) {
                     if (isVoiceAvailable) {
                         Text(
@@ -217,6 +215,7 @@ fun EngagementSheet(
                         )
                     }
                 }
+                */
 
                 Spacer(modifier = Modifier.height(16.dp))
             }
