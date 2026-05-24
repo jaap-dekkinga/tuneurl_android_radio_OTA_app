@@ -8,6 +8,9 @@
 
 
 #include "MapRankInteger.h"
+#include <stdint.h>
+#include <cstring>
+#include <algorithm>
 
 
 MapRankInteger::MapRankInteger(const map<int, int> &_map, bool ascending) : _map(_map), ascending(ascending), array(_map.size())

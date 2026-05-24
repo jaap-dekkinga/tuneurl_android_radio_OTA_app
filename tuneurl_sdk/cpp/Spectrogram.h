@@ -9,6 +9,7 @@
 #ifndef SPECTROGRAM_H
 #define SPECTROGRAM_H
 
+#include <cstdint>
 #include <vector>
 #include "FingerprintProperties.h"
 
