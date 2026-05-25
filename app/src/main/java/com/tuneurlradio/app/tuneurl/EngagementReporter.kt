@@ -58,7 +58,10 @@ class EngagementReporter @Inject constructor() {
         val appContext = context.applicationContext
         scope.launch {
             try {
-                SDKTuneURLManager.addRecordOfInterest(appContext, id, action, date ?: "")
+                // SDK signature takes the TuneURL_ID as String (Java side):
+                //   public static void addRecordOfInterest(Context, String, String, String)
+                // Our Engagement model carries an Int id, so convert here.
+                SDKTuneURLManager.addRecordOfInterest(appContext, id.toString(), action, date ?: "")
                 Log.d(TAG, "Reported $action for engagement id=$id")
             } catch (t: Throwable) {
                 // Reporting must never bubble up — UX is already past the action.
