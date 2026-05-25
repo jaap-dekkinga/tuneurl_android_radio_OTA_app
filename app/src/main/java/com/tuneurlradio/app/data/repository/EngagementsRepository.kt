@@ -25,6 +25,12 @@ class EngagementsRepository @Inject constructor(
         return historyEngagementDao.getAll()
     }
 
+    suspend fun getSavedById(localId: Long): SavedEngagementEntity? =
+        savedEngagementDao.getById(localId)
+
+    suspend fun getHistoryById(localId: Long): HistoryEngagementEntity? =
+        historyEngagementDao.getById(localId)
+
     suspend fun saveEngagement(engagement: Engagement) {
         val entity = SavedEngagementEntity(
             engagementId = engagement.id,
