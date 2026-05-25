@@ -13,6 +13,9 @@ interface SavedEngagementDao {
     @Query("SELECT * FROM saved_engagements ORDER BY createdAt DESC")
     fun getAll(): Flow<List<SavedEngagementEntity>>
 
+    @Query("SELECT * FROM saved_engagements WHERE localId = :localId LIMIT 1")
+    suspend fun getById(localId: Long): SavedEngagementEntity?
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insert(engagement: SavedEngagementEntity)
 
