@@ -17,19 +17,24 @@ data class TurlsHistoryState(
 
 sealed interface TurlsHistoryIntent {
     data class Delete(val engagement: HistoryEngagementEntity) : TurlsHistoryIntent
-    data class ItemClicked(val engagement: HistoryEngagementEntity) : TurlsHistoryIntent
     data object ClearAll : TurlsHistoryIntent
 }
 
-sealed interface TurlsHistoryEffect {
-    data class OpenUrl(val url: String) : TurlsHistoryEffect
-}
+/**
+ * No effects today. The previous `OpenUrl` effect was removed: row taps now
+ * navigate to [com.tuneurlradio.app.ui.screens.engagement.EngagementDetailScreen]
+ * via the navigation graph rather than being dispatched as an effect from the
+ * VM. Kept as a sealed interface for future-proofing.
+ */
+sealed interface TurlsHistoryEffect
 
 @HiltViewModel
 class TurlsHistoryViewModel @Inject constructor(
     private val engagementsRepository: EngagementsRepository,
     private val stationsDataSource: StationsDataSource
-) : MviViewModel<TurlsHistoryState, TurlsHistoryIntent, TurlsHistoryEffect>(TurlsHistoryState()) {
+) : MviViewModel<TurlsHistoryState, TurlsHistoryIntent, TurlsHistoryEffect>(
+    TurlsHistoryState()
+) {
 
     init {
         loadStations()
@@ -52,7 +57,6 @@ class TurlsHistoryViewModel @Inject constructor(
     override fun handleIntent(intent: TurlsHistoryIntent) {
         when (intent) {
             is TurlsHistoryIntent.Delete -> deleteEngagement(intent.engagement)
-            is TurlsHistoryIntent.ItemClicked -> openEngagement(intent.engagement)
             TurlsHistoryIntent.ClearAll -> clearAll()
         }
     }
@@ -60,12 +64,6 @@ class TurlsHistoryViewModel @Inject constructor(
     private fun deleteEngagement(engagement: HistoryEngagementEntity) {
         viewModelScope.launch {
             engagementsRepository.deleteHistoryEngagement(engagement)
-        }
-    }
-
-    private fun openEngagement(engagement: HistoryEngagementEntity) {
-        engagement.info?.let { url ->
-            sendEffect(TurlsHistoryEffect.OpenUrl(url))
         }
     }
 

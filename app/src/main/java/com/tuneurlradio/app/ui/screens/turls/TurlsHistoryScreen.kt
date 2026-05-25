@@ -1,7 +1,5 @@
 package com.tuneurlradio.app.ui.screens.turls
 
-import android.content.Intent
-import android.net.Uri
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -33,13 +31,11 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.rememberSwipeToDismissBoxState
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import com.tuneurlradio.app.data.local.entity.HistoryEngagementEntity
@@ -50,21 +46,10 @@ import java.util.Date
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun TurlsHistoryScreen(
+    onItemOpen: (Long) -> Unit = {},
     viewModel: TurlsHistoryViewModel = hiltViewModel()
 ) {
     val state by viewModel.state.collectAsState()
-    val context = LocalContext.current
-
-    LaunchedEffect(Unit) {
-        viewModel.effect.collect { effect ->
-            when (effect) {
-                is TurlsHistoryEffect.OpenUrl -> {
-                    val intent = Intent(Intent.ACTION_VIEW, Uri.parse(effect.url))
-                    context.startActivity(intent)
-                }
-            }
-        }
-    }
 
     Scaffold(
         topBar = {
@@ -100,7 +85,7 @@ fun TurlsHistoryScreen(
                 EngagementsList(
                     engagements = state.engagements,
                     stations = state.stations,
-                    onItemClick = { viewModel.handleIntent(TurlsHistoryIntent.ItemClicked(it)) },
+                    onItemClick = { onItemOpen(it.localId) },
                     onDelete = { viewModel.handleIntent(TurlsHistoryIntent.Delete(it)) }
                 )
             }
