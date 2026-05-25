@@ -13,6 +13,9 @@ interface HistoryEngagementDao {
     @Query("SELECT * FROM history_engagements ORDER BY createdAt DESC")
     fun getAll(): Flow<List<HistoryEngagementEntity>>
 
+    @Query("SELECT * FROM history_engagements WHERE localId = :localId LIMIT 1")
+    suspend fun getById(localId: Long): HistoryEngagementEntity?
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insert(engagement: HistoryEngagementEntity)
 
