@@ -17,18 +17,23 @@ data class SavedEngagementsState(
 
 sealed interface SavedEngagementsIntent {
     data class Delete(val engagement: SavedEngagementEntity) : SavedEngagementsIntent
-    data class ItemClicked(val engagement: SavedEngagementEntity) : SavedEngagementsIntent
 }
 
-sealed interface SavedEngagementsEffect {
-    data class OpenUrl(val url: String) : SavedEngagementsEffect
-}
+/**
+ * No effects today. The previous `OpenUrl` effect was removed: row taps now
+ * navigate to [com.tuneurlradio.app.ui.screens.engagement.EngagementDetailScreen]
+ * via the navigation graph rather than being dispatched as an effect from the
+ * VM. Kept as a sealed interface for future-proofing.
+ */
+sealed interface SavedEngagementsEffect
 
 @HiltViewModel
 class SavedEngagementsViewModel @Inject constructor(
     private val engagementsRepository: EngagementsRepository,
     private val stationsDataSource: StationsDataSource
-) : MviViewModel<SavedEngagementsState, SavedEngagementsIntent, SavedEngagementsEffect>(SavedEngagementsState()) {
+) : MviViewModel<SavedEngagementsState, SavedEngagementsIntent, SavedEngagementsEffect>(
+    SavedEngagementsState()
+) {
 
     init {
         loadStations()
@@ -51,19 +56,12 @@ class SavedEngagementsViewModel @Inject constructor(
     override fun handleIntent(intent: SavedEngagementsIntent) {
         when (intent) {
             is SavedEngagementsIntent.Delete -> deleteEngagement(intent.engagement)
-            is SavedEngagementsIntent.ItemClicked -> openEngagement(intent.engagement)
         }
     }
 
     private fun deleteEngagement(engagement: SavedEngagementEntity) {
         viewModelScope.launch {
             engagementsRepository.deleteSavedEngagement(engagement)
-        }
-    }
-
-    private fun openEngagement(engagement: SavedEngagementEntity) {
-        engagement.info?.let { url ->
-            sendEffect(SavedEngagementsEffect.OpenUrl(url))
         }
     }
 }
