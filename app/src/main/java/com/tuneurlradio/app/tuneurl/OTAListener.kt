@@ -76,22 +76,18 @@ class OTAListener(private val context: Context) : Constants {
     var onMatchDetected: ((TuneURLMatch) -> Unit)? = null
     private val searchResultReceiver = SearchResultReceiver()
 
+    // Issue 1 fix: track whether the receiver is currently registered, so
+    // stopListening can unregister it eagerly (preventing cross-talk with
+    // the stream-detector broadcast) and startListening can re-register.
+    @Volatile private var receiverRegistered = false
+
     init {
         try {
-            val searchFilter = IntentFilter().apply {
-                addAction(Constants.SEARCH_FINGERPRINT_RESULT_RECEIVED)
-                addAction(Constants.SEARCH_FINGERPRINT_RESULT_ERROR)
-            }
-
-            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
-                context.registerReceiver(searchResultReceiver, searchFilter, Context.RECEIVER_EXPORTED)
-            } else {
-                context.registerReceiver(searchResultReceiver, searchFilter)
-            }
+            ensureSearchReceiverRegistered()
 
             // Load trigger sound on init
             loadTriggerSound()
-            
+
             Log.d(TAG, "OTAListener initialized with trigger-based detection")
         } catch (e: Exception) {
             Log.e(TAG, "Error initializing OTAListener", e)
@@ -189,6 +185,11 @@ class OTAListener(private val context: Context) : Constants {
         Log.d(TAG, "Sample rate: $SAMPLE_RATE Hz")
         Log.d(TAG, "Trigger threshold: ${(TRIGGER_SIMILARITY_THRESHOLD * 100).toInt()}%")
         Log.d(TAG, "================================================")
+
+        // Issue 1 fix: stopListening() unregisters the receiver to avoid
+        // cross-talk with the stream detector. Re-register before we start
+        // again so we can hear our own API results.
+        ensureSearchReceiverRegistered()
         
         try {
             audioRecord = AudioRecord(
@@ -226,15 +227,18 @@ class OTAListener(private val context: Context) : Constants {
 
     fun stopListening() {
         if (!isListening) return
-        
+
         Log.d(TAG, "Stopping OTA listening...")
         isListening = false
-        
-        recordingJob?.cancel()
+
+        // Issue 1 fix: cancel ALL children of listenerScope, not just the two
+        // named jobs. checkForTrigger() spawns nested coroutines on the scope
+        // (resampling, post-trigger capture, API search dispatch) — without
+        // cancelling them we'd see OTA TuneURL_DIAG lines firing AFTER stop.
+        listenerScope.coroutineContext.cancelChildren()
         recordingJob = null
-        processingJob?.cancel()
         processingJob = null
-        
+
         try {
             audioRecord?.stop()
             audioRecord?.release()
@@ -242,13 +246,61 @@ class OTAListener(private val context: Context) : Constants {
         } catch (e: Exception) {
             Log.e(TAG, "Error stopping audio record", e)
         }
-        
+
         synchronized(bufferLock) {
             audioBuffer.clear()
             currentBufferSize = 0
         }
-        
+
+        // Issue 1 fix: unregister the broadcast receiver on stop, not just on
+        // release. While stopped-but-not-released, the stream detector can be
+        // running; without this, an APIService result for the stream detector
+        // would also fire OTAListener's receiver (which then calls back into
+        // onMatchDetected via the OTA path).
+        receiverRegistered = unregisterSearchReceiverIfRegistered()
+
         Log.d(TAG, "OTA listening stopped")
+    }
+
+    /**
+     * Re-register the search broadcast receiver. Called from startListening
+     * after a previous stopListening cycle un-registered it.
+     */
+    private fun ensureSearchReceiverRegistered() {
+        if (receiverRegistered) return
+        try {
+            val searchFilter = IntentFilter().apply {
+                addAction(Constants.SEARCH_FINGERPRINT_RESULT_RECEIVED)
+                addAction(Constants.SEARCH_FINGERPRINT_RESULT_ERROR)
+            }
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+                context.registerReceiver(searchResultReceiver, searchFilter, Context.RECEIVER_EXPORTED)
+            } else {
+                context.registerReceiver(searchResultReceiver, searchFilter)
+            }
+            receiverRegistered = true
+        } catch (e: Exception) {
+            Log.e(TAG, "Error re-registering search receiver", e)
+        }
+    }
+
+    /**
+     * Unregister the receiver if it's currently registered. Returns the new
+     * value `receiverRegistered` should hold (always false here, but written
+     * this way so the caller's assignment reads cleanly).
+     */
+    private fun unregisterSearchReceiverIfRegistered(): Boolean {
+        if (!receiverRegistered) return false
+        return try {
+            context.unregisterReceiver(searchResultReceiver)
+            false
+        } catch (e: IllegalArgumentException) {
+            // Already unregistered — nothing to do.
+            false
+        } catch (e: Exception) {
+            Log.e(TAG, "Error unregistering search receiver", e)
+            false
+        }
     }
     
     private fun startRecordingLoop() {
@@ -446,7 +498,13 @@ class OTAListener(private val context: Context) : Constants {
                 }
                 
                 isProcessing = false
-                
+
+            } catch (e: CancellationException) {
+                // Issue 2 fix: cooperative cancellation must propagate so the
+                // outer detection loop (and any code awaiting this scope) sees
+                // the cancellation rather than continuing as if nothing happened.
+                isProcessing = false
+                throw e
             } catch (e: Exception) {
                 Log.e(TAG, "Error checking for trigger: ${e.message}", e)
                 isProcessing = false
@@ -663,11 +721,9 @@ class OTAListener(private val context: Context) : Constants {
     
     fun release() {
         stopListening()
-        try {
-            context.unregisterReceiver(searchResultReceiver)
-        } catch (e: Exception) {
-            Log.e(TAG, "Error unregistering receiver", e)
-        }
+        // stopListening already cancels children and unregisters the receiver.
+        // Cancelling the scope itself is the final hard kill — after this,
+        // no new coroutines can be launched on listenerScope.
         listenerScope.cancel()
     }
 }
