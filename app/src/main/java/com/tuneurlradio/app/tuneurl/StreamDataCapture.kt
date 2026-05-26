@@ -65,10 +65,9 @@ class StreamDataCapture(private val cacheDir: File) {
                         val chunk = buffer.readByteArray()
                         addChunk(chunk)
                         totalBytesRead += chunk.size
-                        
-                        if (totalBytesRead % 50000 < 8192) {
-                            Log.d(TAG, "Stream data captured: $totalBytesRead bytes total")
-                        }
+                        // Progress logging removed — fires every ~50 KB and pollutes
+                        // logcat with no diagnostic value. The "Stream reading ended"
+                        // line below fires once per stop and is enough.
                     }
                     
                     Log.d(TAG, "Stream reading ended. Total bytes: $totalBytesRead")
