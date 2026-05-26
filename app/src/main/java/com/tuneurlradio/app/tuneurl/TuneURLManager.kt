@@ -82,8 +82,19 @@ class TuneURLManager @Inject constructor(
         Log.d(TAG, "Station ID: $stationId")
         Log.d(TAG, "================================================")
 
-        // Stop OTA listening when radio starts (iOS behavior)
+        // Stop OTA listening when radio starts (iOS behavior).
+        // Issue 1 fix: don't trust the isListening state flag here — tear
+        // down the OTA listener handle unconditionally, in case the flag
+        // and the handle drifted apart (e.g., a stop call failed earlier).
+        // This guarantees we never have OTA and stream detectors running
+        // concurrently, which the user's logs showed actually happening.
         stopOTAListening()
+        otaListener?.let {
+            Log.w(TAG, "Stale OTA listener handle detected after stop — releasing")
+            it.release()
+            otaListener = null
+        }
+        _state.value = _state.value.copy(isListening = false)
 
         currentStationId = stationId
         
