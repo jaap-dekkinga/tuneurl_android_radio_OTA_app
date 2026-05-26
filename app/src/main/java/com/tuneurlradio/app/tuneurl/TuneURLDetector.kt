@@ -47,6 +47,16 @@ class TuneURLDetector(private val context: Context) : Constants {
     private var lastFingerprintTime = 0L
     private var recordingTuneURL = false
 
+    // Issue 3 fix: cooldown after a successful local-gate pass.
+    // The rolling MP3 buffer is ~15 seconds wide and we fingerprint every 2s,
+    // so a single trigger appears in ~7 consecutive windows. Without this gate
+    // we'd fire ~7 server requests for the same trigger. 12s is "trigger
+    // duration (~2s) + buffer length (~15s) minus slack" — long enough that
+    // the trigger has rolled out of the buffer by the time we look again,
+    // short enough that a fresh trigger 30+ seconds later is detected promptly.
+    private val SERVER_CALL_COOLDOWN_MS = 12_000L
+    private var lastServerCallTime = 0L
+
     private var onMatchDetected: ((TuneURLMatch) -> Unit)? = null
     private val searchResultReceiver = SearchResultReceiver()
 
@@ -158,6 +168,12 @@ class TuneURLDetector(private val context: Context) : Constants {
                 recordingTuneURL = true
                 processMP3BufferAndMatch()
             }
+        } catch (e: CancellationException) {
+            // Issue 2 fix: structured cooperative cancellation, not an error.
+            // Without this re-throw, stopDetection() shows up as a red error in
+            // logcat ("Error processing audio buffer ... StandaloneCoroutine was
+            // cancelled") and downstream cancellation logic doesn't propagate.
+            throw e
         } catch (e: Exception) {
             Log.e(TAG, "Error processing audio buffer", e)
         }
@@ -256,6 +272,25 @@ class TuneURLDetector(private val context: Context) : Constants {
                             return@withContext
                         }
                         Log.d(TAG, "Local v2 gate PASSED (similarity=$similarity) — proceeding to server")
+
+                        // Issue 3 fix: server-call cooldown. If we already
+                        // sent a fingerprint for this trigger in the last
+                        // SERVER_CALL_COOLDOWN_MS, swallow this hit. The
+                        // rolling buffer means the same trigger surfaces in
+                        // ~7 consecutive 2-second windows; without this we
+                        // hammer the server 7× for one ad break.
+                        val now = System.currentTimeMillis()
+                        val sinceLast = now - lastServerCallTime
+                        if (sinceLast < SERVER_CALL_COOLDOWN_MS) {
+                            val remainingMs = SERVER_CALL_COOLDOWN_MS - sinceLast
+                            Log.d(
+                                TAG,
+                                "Server-call cooldown active (${remainingMs}ms remaining) — skipping API call"
+                            )
+                            recordingTuneURL = false
+                            return@withContext
+                        }
+                        lastServerCallTime = now
                     } else {
                         Log.w(TAG, "Trigger buffer not loaded — bypassing local gate this cycle")
                     }
@@ -285,6 +320,10 @@ class TuneURLDetector(private val context: Context) : Constants {
 
                 recordingTuneURL = false
 
+            } catch (e: CancellationException) {
+                // Issue 2 fix: cooperative cancellation must propagate.
+                recordingTuneURL = false
+                throw e
             } catch (e: Exception) {
                 Log.e(TAG, "Error processing MP3 buffer: ${e.message}", e)
                 recordingTuneURL = false
