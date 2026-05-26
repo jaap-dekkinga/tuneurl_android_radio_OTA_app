@@ -30,6 +30,14 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
+        continue-on-error: true
+        
+      - name: Retry JDK setup if needed
+        if: failure()
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
