@@ -37,6 +37,20 @@ class TuneURLDetector(private val context: Context) : Constants {
     private val CONTINUOUS_FINGERPRINT_INTERVAL_MS = 2000L  // Match iOS: 2 seconds
     private val MIN_MATCH_PERCENTAGE = 25f
 
+    // Option A (Android-to-iOS parity): narrow the analysis window. The
+    // rolling MP3 capture buffer holds ~15 s of audio, but iOS fingerprints
+    // only the last ~4 s. Fingerprinting the full 15 s makes detection
+    // *robust* (trigger lands somewhere in a wide window) but *slow* — a
+    // trigger doesn't peak in similarity until it sits fully inside the
+    // wide buffer, ~15 s after it played. Narrowing to 4 s drops detection
+    // latency to iOS levels (~2-4 s) at the cost of needing the trigger to
+    // be near the end of the buffer when we fingerprint. With a 2 s analysis
+    // cadence and a 4 s window we get a 2 s overlap, which is exactly iOS's
+    // post-Bug-9 configuration.
+    private val ANALYSIS_WINDOW_SECONDS = 4
+    private val ANALYSIS_WINDOW_SAMPLES = ANALYSIS_WINDOW_SECONDS * FINGERPRINT_SAMPLE_RATE
+    private val ANALYSIS_WINDOW_BYTES = ANALYSIS_WINDOW_SAMPLES * 2  // 16-bit mono
+
     // Local v2 trigger gate. Mirrors iOS local detection (validated 6/6 on iOS).
     // The gate runs v2 explicitly; the server fingerprint stays on v1. See
     // v2_context_android.md / v2_architecture_android.md for the design.
@@ -48,13 +62,12 @@ class TuneURLDetector(private val context: Context) : Constants {
     private var recordingTuneURL = false
 
     // Issue 3 fix: cooldown after a successful local-gate pass.
-    // The rolling MP3 buffer is ~15 seconds wide and we fingerprint every 2s,
-    // so a single trigger appears in ~7 consecutive windows. Without this gate
-    // we'd fire ~7 server requests for the same trigger. 12s is "trigger
-    // duration (~2s) + buffer length (~15s) minus slack" — long enough that
-    // the trigger has rolled out of the buffer by the time we look again,
-    // short enough that a fresh trigger 30+ seconds later is detected promptly.
-    private val SERVER_CALL_COOLDOWN_MS = 12_000L
+    // With the Option-A 4-second analysis window and 2-second cadence, a
+    // single trigger appears in roughly 3 consecutive ticks before sliding
+    // out of the window. Without this gate we'd fire ~3 server requests
+    // for the same trigger. 8 s is long enough to dedupe one trigger and
+    // short enough that a fresh trigger 10+ s later is detected promptly.
+    private val SERVER_CALL_COOLDOWN_MS = 8_000L
     private var lastServerCallTime = 0L
 
     private var onMatchDetected: ((TuneURLMatch) -> Unit)? = null
@@ -234,7 +247,43 @@ class TuneURLDetector(private val context: Context) : Constants {
                     Log.d(TAG, "Resampled to $FINGERPRINT_SAMPLE_RATE Hz: $outputLength bytes")
 
                     resampledBuffer.rewind()
-                    val sampleCount = outputLength / 2
+
+                    // Option A: take the most recent ANALYSIS_WINDOW_SECONDS
+                    // of audio. The captured MP3 buffer is much wider than
+                    // iOS's analysis window; without this trim, a trigger
+                    // doesn't peak in similarity until it slides through the
+                    // full ~15 s buffer, which is exactly the user-visible
+                    // ~15 s pop-up delay.
+                    //
+                    // If the resampled buffer is shorter than the window
+                    // (e.g. early in the stream before the rolling buffer
+                    // has filled), use the whole thing.
+                    val analysisBuffer: ByteBuffer
+                    val analysisSampleCount: Int
+                    if (outputLength <= ANALYSIS_WINDOW_BYTES) {
+                        analysisBuffer = resampledBuffer
+                        analysisSampleCount = outputLength / 2
+                    } else {
+                        val sliceOffset = outputLength - ANALYSIS_WINDOW_BYTES
+                        analysisBuffer = ByteBuffer.allocateDirect(ANALYSIS_WINDOW_BYTES)
+                        analysisBuffer.order(ByteOrder.LITTLE_ENDIAN)
+                        // Copy the last ANALYSIS_WINDOW_BYTES from resampledBuffer.
+                        // bulk get into a temporary array, then put — direct
+                        // ByteBuffer doesn't have a direct slice-with-copy.
+                        val tmp = ByteArray(ANALYSIS_WINDOW_BYTES)
+                        resampledBuffer.position(sliceOffset)
+                        resampledBuffer.get(tmp)
+                        analysisBuffer.put(tmp)
+                        analysisBuffer.rewind()
+                        analysisSampleCount = ANALYSIS_WINDOW_SAMPLES
+                        Log.d(
+                            TAG,
+                            "Sliced to last ${ANALYSIS_WINDOW_SECONDS}s window: " +
+                                "$ANALYSIS_WINDOW_BYTES bytes ($ANALYSIS_WINDOW_SAMPLES samples)"
+                        )
+                    }
+
+                    val sampleCount = analysisSampleCount
 
                     // --- LOCAL v2 TRIGGER GATE -------------------------------
                     // Compare the current stream window against the bundled
@@ -249,13 +298,13 @@ class TuneURLDetector(private val context: Context) : Constants {
                     if (tBuf != null && tLen > 0) {
                         tBuf.rewind()
                         val similarity = TuneURLSDK.calculateSimilarityAt(
-                            resampledBuffer, sampleCount,
+                            analysisBuffer, sampleCount,
                             tBuf, tLen,
                             TuneURLSDK.FORMAT_VERSION_V2
                         )
                         // Restore position for the v1 fingerprint extraction
                         // below; calculateSimilarity advances the buffer.
-                        resampledBuffer.rewind()
+                        analysisBuffer.rewind()
 
                         // DIAG line prescribed by v2_architecture_android.md §4.
                         // Unconditional — this is THE log line the iOS effort
@@ -275,10 +324,10 @@ class TuneURLDetector(private val context: Context) : Constants {
 
                         // Issue 3 fix: server-call cooldown. If we already
                         // sent a fingerprint for this trigger in the last
-                        // SERVER_CALL_COOLDOWN_MS, swallow this hit. The
-                        // rolling buffer means the same trigger surfaces in
-                        // ~7 consecutive 2-second windows; without this we
-                        // hammer the server 7× for one ad break.
+                        // SERVER_CALL_COOLDOWN_MS, swallow this hit. With
+                        // the 4-second analysis window the same trigger
+                        // surfaces in ~3 consecutive 2-second ticks;
+                        // without this we'd hammer the server 3× per ad.
                         val now = System.currentTimeMillis()
                         val sinceLast = now - lastServerCallTime
                         if (sinceLast < SERVER_CALL_COOLDOWN_MS) {
@@ -296,7 +345,7 @@ class TuneURLDetector(private val context: Context) : Constants {
                     }
                     // ---------------------------------------------------------
 
-                    val fingerprintBytes = TuneURLSDK.extractFingerprintFromBuffer(resampledBuffer, sampleCount)
+                    val fingerprintBytes = TuneURLSDK.extractFingerprintFromBuffer(analysisBuffer, sampleCount)
 
                     if (fingerprintBytes != null) {
                         val fingerprintString = fingerprintBytes.joinToString(",") {
