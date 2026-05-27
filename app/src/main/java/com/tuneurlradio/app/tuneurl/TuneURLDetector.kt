@@ -61,12 +61,19 @@ class TuneURLDetector(private val context: Context) : Constants {
     private var lastFingerprintTime = 0L
     private var recordingTuneURL = false
 
-    // Issue 3 fix: cooldown after a successful local-gate pass.
+    // Issue 3 fix: cooldown after a SUCCESSFUL server match.
     // With the Option-A 4-second analysis window and 2-second cadence, a
     // single trigger appears in roughly 3 consecutive ticks before sliding
     // out of the window. Without this gate we'd fire ~3 server requests
-    // for the same trigger. 8 s is long enough to dedupe one trigger and
-    // short enough that a fresh trigger 10+ s later is detected promptly.
+    // for the same trigger.
+    //
+    // IMPORTANT: lastServerCallTime is updated only inside handleSearchSuccess
+    // when the server returned a >= MIN_MATCH_PERCENTAGE match. If the server
+    // returned a low-match response (e.g. 8% when the trigger was only
+    // half-in-window), we do NOT set the cooldown — the next tick may have a
+    // stronger fingerprint and we want it to reach the server. The
+    // manager-level MATCH_COOLDOWN_MS handles dedupe of the engagement sheet
+    // once a real match has fired.
     private val SERVER_CALL_COOLDOWN_MS = 8_000L
     private var lastServerCallTime = 0L
 
@@ -322,24 +329,32 @@ class TuneURLDetector(private val context: Context) : Constants {
                         }
                         Log.d(TAG, "Local v2 gate PASSED (similarity=$similarity) — proceeding to server")
 
-                        // Issue 3 fix: server-call cooldown. If we already
-                        // sent a fingerprint for this trigger in the last
-                        // SERVER_CALL_COOLDOWN_MS, swallow this hit. With
-                        // the 4-second analysis window the same trigger
-                        // surfaces in ~3 consecutive 2-second ticks;
-                        // without this we'd hammer the server 3× per ad.
+                        // Issue 3 fix: server-call cooldown. lastServerCallTime
+                        // is set only after a SUCCESSFUL server match (see
+                        // handleSearchSuccess). If a previous successful match
+                        // fired within SERVER_CALL_COOLDOWN_MS, swallow this
+                        // local-gate pass — the manager-level match cooldown
+                        // already prevents duplicate engagement sheets, and
+                        // we don't want to thrash the server with repeated
+                        // calls for an already-matched trigger.
+                        //
+                        // Note: this does NOT block calls after the server
+                        // returned a sub-threshold match (e.g. 8%). In that
+                        // case lastServerCallTime stayed at its old value,
+                        // so the next tick — which may have a stronger
+                        // fingerprint — is free to retry.
                         val now = System.currentTimeMillis()
                         val sinceLast = now - lastServerCallTime
                         if (sinceLast < SERVER_CALL_COOLDOWN_MS) {
                             val remainingMs = SERVER_CALL_COOLDOWN_MS - sinceLast
                             Log.d(
                                 TAG,
-                                "Server-call cooldown active (${remainingMs}ms remaining) — skipping API call"
+                                "Server-call cooldown active (${remainingMs}ms remaining since last GOOD match) — skipping API call"
                             )
                             recordingTuneURL = false
                             return@withContext
                         }
-                        lastServerCallTime = now
+                        // (no eager set of lastServerCallTime here — see handleSearchSuccess)
                     } else {
                         Log.w(TAG, "Trigger buffer not loaded — bypassing local gate this cycle")
                     }
@@ -675,6 +690,12 @@ class TuneURLDetector(private val context: Context) : Constants {
                 Log.d(TAG, "================================================")
 
                 if (isValidMatch) {
+                    // Issue 3 fix: arm the server-call cooldown only on a
+                    // confirmed good match. Sub-threshold server responses
+                    // leave the cooldown un-armed so the next, stronger
+                    // window can still reach the server.
+                    lastServerCallTime = System.currentTimeMillis()
+
                     val match = TuneURLMatch(
                         id = matchId,
                         name = matchName,
