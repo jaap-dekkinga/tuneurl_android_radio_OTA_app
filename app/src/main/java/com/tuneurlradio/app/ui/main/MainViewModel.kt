@@ -163,13 +163,20 @@ class MainViewModel @Inject constructor(
      * - When radio plays: OTA listening stops, stream parsing starts
      * - When radio stops: Stream parsing stops, OTA listening starts
      */
+    /**
+     * Toggle radio play/stop.
+     *
+     * Stop now means *quiet*: it stops the stream and stops fingerprinting,
+     * and does NOT auto-start microphone OTA listening. If the user wants
+     * mic OTA, they have to ask for it via the explicit OTA toggle.
+     */
     private fun togglePlayback() {
         val station = currentState.currentStation ?: return
-        
+
         if (currentState.isPlaying) {
-            // Stop radio - this will start OTA listening automatically
+            // Stop radio. Goes quiet — no auto-OTA.
             radioPlayerManager.stop()
-            tuneURLManager.stopStreamParsing() // This starts OTA listening
+            tuneURLManager.stopStreamParsing()
         } else {
             // Play radio - this will stop OTA listening and start stream parsing
             radioPlayerManager.play(station)
@@ -180,14 +187,17 @@ class MainViewModel @Inject constructor(
     }
 
     /**
-     * Toggle OTA (microphone) listening manually
-     * iOS behavior: If radio is playing, stop it first, then toggle OTA
+     * Toggle OTA (microphone) listening manually.
+     * If radio is playing, stop it first, then start OTA listening.
      */
     private fun toggleOTAListening() {
         if (currentState.isPlaying) {
-            // Stop radio first, then OTA listening will start automatically
+            // Stop radio first, then start OTA listening. Stream-parser
+            // teardown is decoupled from OTA start now (the user wants OTA
+            // specifically here, so we ask for it explicitly).
             radioPlayerManager.stop()
             tuneURLManager.stopStreamParsing()
+            tuneURLManager.startOTAListening()
         } else if (currentState.isOTAListening) {
             // Stop OTA listening
             tuneURLManager.stopOTAListening()
