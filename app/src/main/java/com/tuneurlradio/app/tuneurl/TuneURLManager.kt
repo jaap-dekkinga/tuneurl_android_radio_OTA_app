@@ -115,8 +115,15 @@ class TuneURLManager @Inject constructor(
     }
 
     /**
-     * Stop stream parsing when radio stops
-     * This automatically starts OTA listening (like iOS behavior)
+     * Stop stream parsing when radio stops.
+     *
+     * Note: this used to auto-start OTA listening (to mirror an early
+     * interpretation of iOS behavior). It no longer does. Stopping the
+     * stream should leave the app *quiet* — the user who pressed pause
+     * doesn't expect the microphone to immediately start listening.
+     *
+     * Callers that want OTA listening after stopping the stream (e.g. the
+     * explicit "toggle OTA" path) call `startOTAListening()` themselves.
      */
     fun stopStreamParsing() {
         Log.d(TAG, "Stopping stream parsing...")
@@ -124,11 +131,7 @@ class TuneURLManager @Inject constructor(
         streamParser?.release()
         streamParser = null
         _state.value = _state.value.copy(isStreamParsing = false)
-        
-        // Start OTA listening when radio stops (iOS behavior)
-        startOTAListening()
-        
-        Log.d(TAG, "Stream parsing stopped, OTA listening started")
+        Log.d(TAG, "Stream parsing stopped")
     }
 
     /**
@@ -198,8 +201,11 @@ class TuneURLManager @Inject constructor(
     }
 
     /**
-     * Toggle OTA listening on/off
-     * If radio is playing, this will stop the radio and start OTA listening
+     * Toggle microphone OTA listening on/off.
+     *
+     * This only toggles OTA — it does NOT stop a playing radio stream.
+     * Callers that need radio-stop-then-OTA-start should drive that
+     * sequence from the ViewModel layer.
      */
     fun toggleOTAListening(): Boolean {
         return if (_state.value.isListening) {
