@@ -43,6 +43,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.core.content.pm.PackageInfoCompat
 import androidx.hilt.navigation.compose.hiltViewModel
 import com.tuneurlradio.app.domain.model.EngagementDisplayMode
 
@@ -225,13 +226,6 @@ private fun VersionFooter() {
     val context = LocalContext.current
     val packageInfo = context.packageManager.getPackageInfo(context.packageName, 0)
     val version = packageInfo.versionName ?: "-"
-
-    // add with the other imports at the top of SettingsScreen.kt
-    import androidx.core.content.pm.PackageInfoCompat
-    
-    // line 228: replace
-    val build = packageInfo.longVersionCode.toString()
-    // with
     val build = PackageInfoCompat.getLongVersionCode(packageInfo).toString()
 
     Text(
