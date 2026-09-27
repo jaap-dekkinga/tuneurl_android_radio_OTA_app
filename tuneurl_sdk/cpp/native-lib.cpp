@@ -60,6 +60,47 @@ Java_com_dekidea_tuneurl_TuneURLNative_getSimilarity(JNIEnv* env, jobject /* thi
     return similarity.similarity;
 }
 
+/**
+ * Like getSimilarity, but also returns where in buffer 1 the best match was
+ * found. Mirrors what the iOS StreamDetector reads from CompareFingerprints to
+ * locate the trigger inside the analysis window.
+ *
+ * Returns float[3] = { similarity, mostSimilarStartTime (seconds from the
+ * start of buffer 1), score }, or null if either fingerprint could not be
+ * extracted.
+ */
+extern "C" JNIEXPORT jfloatArray JNICALL
+Java_com_dekidea_tuneurl_TuneURLNative_getSimilarityDetails(JNIEnv* env, jobject /* this */, jobject byteBuffer1, jint waveLength1, jobject byteBuffer2, jint waveLength2, jint emitVersion) {
+
+    int16_t* wave1 = (int16_t*) env->GetDirectBufferAddress(byteBuffer1);
+    int16_t* wave2 = (int16_t*) env->GetDirectBufferAddress(byteBuffer2);
+    if (wave1 == nullptr || wave2 == nullptr) {
+        return nullptr;
+    }
+
+    Fingerprint* fingerprint1 = ExtractFingerprint(wave1, waveLength1, emitVersion);
+    Fingerprint* fingerprint2 = ExtractFingerprint(wave2, waveLength2, emitVersion);
+
+    if (fingerprint1 == nullptr || fingerprint2 == nullptr) {
+        FingerprintFree(fingerprint1);
+        FingerprintFree(fingerprint2);
+        return nullptr;
+    }
+
+    FingerprintSimilarity similarity = CompareFingerprints(fingerprint1, fingerprint2);
+
+    FingerprintFree(fingerprint1);
+    FingerprintFree(fingerprint2);
+
+    jfloat values[3] = { similarity.similarity, similarity.mostSimilarStartTime, similarity.score };
+    jfloatArray result = env->NewFloatArray(3);
+    if (result == nullptr) {
+        return nullptr;
+    }
+    env->SetFloatArrayRegion(result, 0, 3, values);
+    return result;
+}
+
 // JNI methods for NativeResampler.kt
 extern "C" JNIEXPORT jlong JNICALL
 Java_com_dekidea_tuneurl_NativeResampler_nativeCreate(JNIEnv* env, jobject /* this */, jint inputRate, jint outputRate, jint channels) {

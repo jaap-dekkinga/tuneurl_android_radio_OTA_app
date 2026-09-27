@@ -5,17 +5,23 @@ import okhttp3.*
 import java.io.File
 import java.io.IOException
 import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.atomic.AtomicInteger                      // NEW
 
 class StreamDataCapture(private val cacheDir: File) {
 
     private val TAG = "StreamDataCapture"
-    private val MAX_BUFFER_SIZE = 250_000
+    // Rolling buffer of compressed stream bytes. TuneURLDetector needs the
+    // most recent ~6 s of audio (4 s trigger window, 5 s post-trigger clip,
+    // plus margin). 500 KB is ~31 s at 128 kbps and ~12.5 s at 320 kbps;
+    // the previous 250 KB left only ~6 s at 320 kbps.
+    private val MAX_BUFFER_SIZE = 500_000                              // was 250_000
     private val mediaDataChunks = ConcurrentLinkedQueue<ByteArray>()
-    private var currentBufferSize = 0
+    // Written on OkHttp's reader thread, read from the detector's thread.
+    private val currentBufferSize = AtomicInteger(0)                   // was: private var currentBufferSize = 0
 
     private var client: OkHttpClient? = null
     private var currentCall: Call? = null
-    private var isCapturing = false
+    @Volatile private var isCapturing = false                          // was: private var isCapturing = false
 
     fun startCapture(streamUrl: String) {
         if (isCapturing) {
@@ -30,7 +36,7 @@ class StreamDataCapture(private val cacheDir: File) {
 
         isCapturing = true
         mediaDataChunks.clear()
-        currentBufferSize = 0
+        currentBufferSize.set(0)                                       // was: currentBufferSize = 0
 
         client = OkHttpClient.Builder().build()
 
@@ -47,7 +53,7 @@ class StreamDataCapture(private val cacheDir: File) {
 
             override fun onResponse(call: Call, response: Response) {
                 Log.d(TAG, "Stream response received: ${response.code}")
-                
+
                 if (!response.isSuccessful) {
                     Log.e(TAG, "Stream response not successful: ${response.code}")
                     isCapturing = false
@@ -65,11 +71,8 @@ class StreamDataCapture(private val cacheDir: File) {
                         val chunk = buffer.readByteArray()
                         addChunk(chunk)
                         totalBytesRead += chunk.size
-                        // Progress logging removed — fires every ~50 KB and pollutes
-                        // logcat with no diagnostic value. The "Stream reading ended"
-                        // line below fires once per stop and is enough.
                     }
-                    
+
                     Log.d(TAG, "Stream reading ended. Total bytes: $totalBytesRead")
                 } catch (e: Exception) {
                     if (isCapturing) {
@@ -95,19 +98,19 @@ class StreamDataCapture(private val cacheDir: File) {
 
     private fun addChunk(chunk: ByteArray) {
         mediaDataChunks.add(chunk)
-        currentBufferSize += chunk.size
+        currentBufferSize.addAndGet(chunk.size)                        // was: currentBufferSize += chunk.size
 
-        while (currentBufferSize > MAX_BUFFER_SIZE && mediaDataChunks.isNotEmpty()) {
+        while (currentBufferSize.get() > MAX_BUFFER_SIZE && mediaDataChunks.isNotEmpty()) {
             val removed = mediaDataChunks.poll()
             if (removed != null) {
-                currentBufferSize -= removed.size
+                currentBufferSize.addAndGet(-removed.size)             // was: currentBufferSize -= removed.size
             }
         }
     }
 
     fun saveCurrentBufferToFile(): File? {
-        Log.d(TAG, "saveCurrentBufferToFile called, chunks: ${mediaDataChunks.size}, size: $currentBufferSize")
-        
+        Log.d(TAG, "saveCurrentBufferToFile called, chunks: ${mediaDataChunks.size}, size: ${currentBufferSize.get()}")
+
         if (mediaDataChunks.isEmpty()) {
             Log.w(TAG, "No data in buffer to save")
             return null
@@ -123,7 +126,10 @@ class StreamDataCapture(private val cacheDir: File) {
             offset += chunk.size
         }
 
-        val file = File(cacheDir, "stream_chunk_${System.currentTimeMillis()}.mp3")
+        // Unique name: the trigger check and the post-trigger lookup can each
+        // save a copy, and a millisecond timestamp alone could collide (one
+        // caller would then delete the other's file).
+        val file = File.createTempFile("stream_chunk_", ".mp3", cacheDir) // was: File(cacheDir, "stream_chunk_${System.currentTimeMillis()}.mp3")
         file.writeBytes(combinedData)
 
         Log.d(TAG, "Saved ${combinedData.size} bytes to ${file.name}")
@@ -133,7 +139,7 @@ class StreamDataCapture(private val cacheDir: File) {
 
     fun clearBuffer() {
         mediaDataChunks.clear()
-        currentBufferSize = 0
+        currentBufferSize.set(0)                                       // was: currentBufferSize = 0
         Log.d(TAG, "Buffer cleared")
     }
 }

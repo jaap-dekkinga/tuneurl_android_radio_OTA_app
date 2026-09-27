@@ -5,6 +5,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.media.AudioFormat
 import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
@@ -17,10 +18,14 @@ import com.dekidea.tuneurl.util.Constants
 import com.google.gson.JsonParser
 import com.tuneurlradio.app.R
 import kotlinx.coroutines.*
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import kotlin.math.ceil
+import kotlin.math.max
+import kotlin.math.min
 
 class TuneURLDetector(private val context: Context) : Constants {
 
@@ -29,7 +34,7 @@ class TuneURLDetector(private val context: Context) : Constants {
     private val detectorScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     private var detectionJob: Job? = null
-    private var isDetecting = false
+    @Volatile private var isDetecting = false
     private var currentStreamUrl: String? = null
 
     private val DETECTION_INTERVAL_MS = 500L
@@ -37,21 +42,26 @@ class TuneURLDetector(private val context: Context) : Constants {
     private val CONTINUOUS_FINGERPRINT_INTERVAL_MS = 2000L  // Match iOS: 2 seconds
     private val MIN_MATCH_PERCENTAGE = 25f
 
-    // Option A (Android-to-iOS parity): narrow the analysis window. The
-    // rolling MP3 capture buffer holds ~15 s of audio, but iOS fingerprints
-    // only the last ~4 s. Fingerprinting the full 15 s makes detection
-    // *robust* (trigger lands somewhere in a wide window) but *slow* — a
-    // trigger doesn't peak in similarity until it sits fully inside the
-    // wide buffer, ~15 s after it played. Narrowing to 4 s drops detection
-    // latency to iOS levels (~2-4 s) at the cost of needing the trigger to
-    // be near the end of the buffer when we fingerprint. With a 2 s analysis
-    // cadence and a 4 s window we get a 2 s overlap, which is exactly iOS's
-    // post-Bug-9 configuration.
-    private val ANALYSIS_WINDOW_SECONDS = 4
-    private val ANALYSIS_WINDOW_SAMPLES = ANALYSIS_WINDOW_SECONDS * FINGERPRINT_SAMPLE_RATE
-    private val ANALYSIS_WINDOW_BYTES = ANALYSIS_WINDOW_SAMPLES * 2  // 16-bit mono
+    // Local trigger gate window: the last 4 s of stream audio, checked every
+    // 2 s (same as iOS StreamDetector.triggerWindowDuration).
+    private val ANALYSIS_WINDOW_SECONDS = 4.0
+    private val ANALYSIS_WINDOW_SAMPLES = (ANALYSIS_WINDOW_SECONDS * FINGERPRINT_SAMPLE_RATE).toInt()
 
-    // Local v2 trigger gate. Mirrors iOS local detection (validated 6/6 on iOS).
+    // iOS parity (StreamDetector.recognizedTrigger): once the trigger is
+    // found, the server is NOT sent the window that contains the trigger.
+    // It is sent the 5 s of audio that FOLLOWS the trigger, which is the part
+    // that identifies the specific TuneURL. The trigger itself is identical
+    // in every TuneURL, so fingerprinting it makes the server return an
+    // arbitrary entry. These are the same constants iOS uses.
+    private val TRIGGER_SOUND_DURATION_SECONDS = 2.0
+    private val IDENTIFIABLE_AUDIO_DURATION_SECONDS = 5.0
+    private val IDENTIFIABLE_AUDIO_SAMPLES = (IDENTIFIABLE_AUDIO_DURATION_SECONDS * FINGERPRINT_SAMPLE_RATE).toInt()
+
+    // Only the tail of the ~15 s capture buffer is resampled; this must cover
+    // the larger of the two windows above, plus a little margin.
+    private val DECODE_TAIL_SECONDS = 6.0
+
+    // Local v2 trigger gate. Mirrors iOS local detection.
     // The gate runs v2 explicitly; the server fingerprint stays on v1. See
     // v2_context_android.md / v2_architecture_android.md for the design.
     private val TRIGGER_SIMILARITY_THRESHOLD = 0.10f  // Match iOS gate (0.1)
@@ -59,26 +69,30 @@ class TuneURLDetector(private val context: Context) : Constants {
     private var triggerSampleCount = 0
 
     private var lastFingerprintTime = 0L
-    private var recordingTuneURL = false
+    @Volatile private var recordingTuneURL = false
 
-    // Issue 3 fix: cooldown after a SUCCESSFUL server match.
-    // With the Option-A 4-second analysis window and 2-second cadence, a
-    // single trigger appears in roughly 3 consecutive ticks before sliding
-    // out of the window. Without this gate we'd fire ~3 server requests
-    // for the same trigger.
-    //
-    // IMPORTANT: lastServerCallTime is updated only inside handleSearchSuccess
-    // when the server returned a >= MIN_MATCH_PERCENTAGE match. If the server
-    // returned a low-match response (e.g. 8% when the trigger was only
-    // half-in-window), we do NOT set the cooldown — the next tick may have a
-    // stronger fingerprint and we want it to reach the server. The
-    // manager-level MATCH_COOLDOWN_MS handles dedupe of the engagement sheet
-    // once a real match has fired.
+    // A trigger was found and we are waiting for the post-trigger audio to
+    // arrive before fingerprinting it. While this is active the gate is not
+    // re-run, so one trigger produces exactly one server request (the
+    // trigger stays inside the 4 s window for ~2 ticks).
+    @Volatile private var pendingLookup: Job? = null
+
+    // Cooldown after a SUCCESSFUL server match: lastServerCallTime is set only
+    // inside handleSearchSuccess when the server returned a
+    // >= MIN_MATCH_PERCENTAGE match. The manager-level MATCH_COOLDOWN_MS
+    // handles dedupe of the engagement sheet once a real match has fired.
     private val SERVER_CALL_COOLDOWN_MS = 8_000L
-    private var lastServerCallTime = 0L
+    @Volatile private var lastServerCallTime = 0L
 
     private var onMatchDetected: ((TuneURLMatch) -> Unit)? = null
     private val searchResultReceiver = SearchResultReceiver()
+
+    /** Decoded PCM plus the format the DECODER actually produced. */
+    private class DecodedAudio(
+        val samples: ShortArray,   // interleaved 16-bit
+        val sampleRate: Int,
+        val channelCount: Int
+    )
 
     init {
         try {
@@ -124,7 +138,7 @@ class TuneURLDetector(private val context: Context) : Constants {
         Log.i(TAG, "DIAG-V1-ROLLBACK: format version forced to v${TuneURLSDK.getFormatVersion()}")
 
         // Load the bundled trigger sound for the local v2 gate. The gate uses
-        // TuneURLSDK.calculateSimilarityAt(..., FORMAT_VERSION_V2) at the call
+        // TuneURLSDK.findSimilarityAt(..., FORMAT_VERSION_V2) at the call
         // site, so it is independent of the singleton version above.
         if (triggerBuffer == null) {
             loadTriggerSound()
@@ -137,7 +151,7 @@ class TuneURLDetector(private val context: Context) : Constants {
         dataCapture.startCapture(streamUrl)
         scheduleDetectionTask()
 
-        Log.d(TAG, "TuneURL detection started (using raw MP3 capture)")
+        Log.d(TAG, "TuneURL detection started (using raw stream capture)")
         Log.d(TAG, "Detection interval: ${DETECTION_INTERVAL_MS}ms")
         Log.d(TAG, "Fingerprint interval: ${CONTINUOUS_FINGERPRINT_INTERVAL_MS}ms")
         Log.d(TAG, "Local v2 trigger gate threshold: $TRIGGER_SIMILARITY_THRESHOLD")
@@ -148,6 +162,8 @@ class TuneURLDetector(private val context: Context) : Constants {
         isDetecting = false
         detectionJob?.cancel()
         detectionJob = null
+        pendingLookup?.cancel()
+        pendingLookup = null
         dataCapture.stopCapture()
         currentStreamUrl = null
         onMatchDetected = null
@@ -181,228 +197,200 @@ class TuneURLDetector(private val context: Context) : Constants {
         try {
             if (recordingTuneURL) return
 
+            // A trigger was already found; its post-trigger audio is being
+            // collected. Don't re-detect the same trigger.
+            if (pendingLookup?.isActive == true) return
+
             val currentTime = System.currentTimeMillis()
             if ((currentTime - lastFingerprintTime) >= CONTINUOUS_FINGERPRINT_INTERVAL_MS) {
-                Log.d(TAG, "Processing MP3 buffer for fingerprinting...")
                 lastFingerprintTime = currentTime
                 recordingTuneURL = true
-                processMP3BufferAndMatch()
+                checkForTrigger()
             }
         } catch (e: CancellationException) {
-            // Issue 2 fix: structured cooperative cancellation, not an error.
-            // Without this re-throw, stopDetection() shows up as a red error in
-            // logcat ("Error processing audio buffer ... StandaloneCoroutine was
-            // cancelled") and downstream cancellation logic doesn't propagate.
+            // Structured cooperative cancellation, not an error.
             throw e
         } catch (e: Exception) {
             Log.e(TAG, "Error processing audio buffer", e)
+        } finally {
+            recordingTuneURL = false
         }
     }
 
-    private suspend fun processMP3BufferAndMatch() {
+    /**
+     * Step 1 (every 2 s): look for the trigger sound in the last 4 s of audio.
+     * If it's there, work out how long ago it played and schedule step 2.
+     */
+    private suspend fun checkForTrigger() {
         withContext(Dispatchers.IO) {
+            val recent = captureRecentAudio(DECODE_TAIL_SECONDS) ?: return@withContext
+
+            val windowSamples = min(recent.size, ANALYSIS_WINDOW_SAMPLES)
+            if (windowSamples < FINGERPRINT_SAMPLE_RATE) {
+                Log.d(TAG, "Only ${recent.size} samples buffered — waiting for more audio")
+                return@withContext
+            }
+            val window = recent.copyOfRange(recent.size - windowSamples, recent.size)
+            val windowSeconds = windowSamples.toDouble() / FINGERPRINT_SAMPLE_RATE
+
+            val tBuf = triggerBuffer
+            val tLen = triggerSampleCount
+            if (tBuf == null || tLen <= 0) {
+                // No trigger asset: we can't locate a trigger, so fall back to
+                // looking up the most recent audio directly (old behaviour).
+                // The server flow is the safety net.
+                Log.w(TAG, "Trigger buffer not loaded — bypassing local gate this cycle")
+                scheduleServerLookup(0.0)
+                return@withContext
+            }
+
+            val match = TuneURLSDK.findSimilarityAt(
+                shortsToDirectBuffer(window), windowSamples,
+                tBuf, tLen,
+                TuneURLSDK.FORMAT_VERSION_V2
+            )
+
+            // Unconditional diagnostic, same fields as the iOS TuneURL_DIAG line.
+            // (mostSimilarStartTime is meaningless when nothing matched.)
+            val hasMatch = match != null && match.similarity > 0f
+            Log.i(
+                "TuneURL_DIAG",
+                "local v2 similarity=%.4f score=%.2f mostSimilarStartTime=%.3f (threshold=%.2f) at t=%d".format(
+                    match?.similarity ?: -1f,
+                    match?.score ?: -1f,
+                    if (hasMatch) match!!.mostSimilarStartTime else -1f,
+                    TRIGGER_SIMILARITY_THRESHOLD,
+                    System.currentTimeMillis()
+                )
+            )
+
+            if (match == null || match.similarity < TRIGGER_SIMILARITY_THRESHOLD) {
+                // No trigger in this window — don't bother the server.
+                return@withContext
+            }
+
+            // Cooldown after a confirmed good match (see handleSearchSuccess).
+            val sinceLast = System.currentTimeMillis() - lastServerCallTime
+            if (sinceLast < SERVER_CALL_COOLDOWN_MS) {
+                Log.d(
+                    TAG,
+                    "Server-call cooldown active (${SERVER_CALL_COOLDOWN_MS - sinceLast}ms remaining since last GOOD match) — skipping"
+                )
+                return@withContext
+            }
+
+            // Same arithmetic as iOS StreamDetector.recognizedTrigger:
+            // how long ago did the trigger start, how much post-trigger audio
+            // do we already have, and how long until we have 5 s of it?
+            val timeSinceTriggerStart = windowSeconds - match.mostSimilarStartTime
+            val recordedAfterTrigger = timeSinceTriggerStart - TRIGGER_SOUND_DURATION_SECONDS
+            val remainingToRecord = max(IDENTIFIABLE_AUDIO_DURATION_SECONDS - recordedAfterTrigger, 0.0)
+
+            Log.d(
+                TAG,
+                "Local v2 gate PASSED (similarity=%.4f). Trigger started %.2fs ago; fingerprinting post-trigger audio in %.2fs".format(
+                    match.similarity, timeSinceTriggerStart, remainingToRecord
+                )
+            )
+
+            scheduleServerLookup(remainingToRecord)
+        }
+    }
+
+    /**
+     * Step 2: after [delaySeconds], fingerprint the most recent 5 s of audio
+     * (the audio that followed the trigger) with v1 and send it to the server.
+     */
+    private fun scheduleServerLookup(delaySeconds: Double) {
+        if (pendingLookup?.isActive == true) return
+
+        pendingLookup = detectorScope.launch {
             try {
-                Log.d(TAG, "Processing MP3 buffer...")
+                delay((delaySeconds * 1000).toLong())
+                if (!isDetecting) return@launch
 
-                val mp3File = dataCapture.saveCurrentBufferToFile()
-
-                if (mp3File == null) {
-                    Log.w(TAG, "No MP3 data available yet")
-                    recordingTuneURL = false
-                    return@withContext
+                val recent = captureRecentAudio(DECODE_TAIL_SECONDS) ?: return@launch
+                val sampleCount = min(recent.size, IDENTIFIABLE_AUDIO_SAMPLES)
+                if (sampleCount < IDENTIFIABLE_AUDIO_SAMPLES) {
+                    Log.w(TAG, "Only $sampleCount samples of post-trigger audio available (wanted $IDENTIFIABLE_AUDIO_SAMPLES)")
                 }
+                val segment = recent.copyOfRange(recent.size - sampleCount, recent.size)
 
-                Log.d(TAG, "MP3 file saved: ${mp3File.name}, size: ${mp3File.length()} bytes")
+                // Uses the SDK singleton version, forced to v1 in startDetection
+                // (the server expects v1).
+                val fingerprintBytes = TuneURLSDK.extractFingerprintFromBuffer(
+                    shortsToDirectBuffer(segment), sampleCount
+                )
 
-                val pcmData = decodeMp3ToPcm(mp3File.absolutePath)
-                val sampleRate = getDecodedSampleRate(mp3File.absolutePath)
+                if (fingerprintBytes != null) {
+                    val fingerprintString = fingerprintBytes.joinToString(",") {
+                        (it.toInt() and 0xff).toString()
+                    }
 
-                mp3File.delete()
+                    Log.d(TAG, "================================================")
+                    Log.d(TAG, "FINGERPRINT EXTRACTED (post-trigger audio)")
+                    Log.d(TAG, "Audio: ${sampleCount.toDouble() / FINGERPRINT_SAMPLE_RATE}s, fingerprint: ${fingerprintBytes.size} bytes")
+                    Log.d(TAG, "Searching via API...")
+                    Log.d(TAG, "================================================")
 
-                if (pcmData == null || pcmData.isEmpty()) {
-                    Log.e(TAG, "Failed to decode MP3")
-                    recordingTuneURL = false
-                    return@withContext
+                    searchFingerprintViaSDK(fingerprintString)
+                } else {
+                    Log.w(TAG, "Fingerprint extraction returned null")
                 }
-
-                Log.d(TAG, "MP3 decoded: ${pcmData.size} bytes PCM at $sampleRate Hz")
-
-                val monoData = convertToMono(pcmData)
-                Log.d(TAG, "Converted to mono: ${monoData.size} bytes")
-
-                val sourceBuffer = ByteBuffer.allocateDirect(monoData.size)
-                sourceBuffer.order(ByteOrder.LITTLE_ENDIAN)
-                sourceBuffer.put(monoData)
-                sourceBuffer.rewind()
-
-                val resampledSize = ((FINGERPRINT_SAMPLE_RATE.toDouble() / sampleRate.toDouble()) * monoData.size).toInt()
-                val resampledBuffer = ByteBuffer.allocateDirect(resampledSize)
-                resampledBuffer.order(ByteOrder.LITTLE_ENDIAN)
-
-                val resample = NativeResampler()
-                try {
-                    resample.create(sampleRate, FINGERPRINT_SAMPLE_RATE, 2048, 1)
-
-                    val outputLength = resample.resampleEx(sourceBuffer, resampledBuffer, sourceBuffer.remaining())
-
-                    if (outputLength <= 0) {
-                        Log.e(TAG, "Resampling failed")
-                        recordingTuneURL = false
-                        return@withContext
-                    }
-
-                    Log.d(TAG, "Resampled to $FINGERPRINT_SAMPLE_RATE Hz: $outputLength bytes")
-
-                    resampledBuffer.rewind()
-
-                    // Option A: take the most recent ANALYSIS_WINDOW_SECONDS
-                    // of audio. The captured MP3 buffer is much wider than
-                    // iOS's analysis window; without this trim, a trigger
-                    // doesn't peak in similarity until it slides through the
-                    // full ~15 s buffer, which is exactly the user-visible
-                    // ~15 s pop-up delay.
-                    //
-                    // If the resampled buffer is shorter than the window
-                    // (e.g. early in the stream before the rolling buffer
-                    // has filled), use the whole thing.
-                    val analysisBuffer: ByteBuffer
-                    val analysisSampleCount: Int
-                    if (outputLength <= ANALYSIS_WINDOW_BYTES) {
-                        analysisBuffer = resampledBuffer
-                        analysisSampleCount = outputLength / 2
-                    } else {
-                        val sliceOffset = outputLength - ANALYSIS_WINDOW_BYTES
-                        analysisBuffer = ByteBuffer.allocateDirect(ANALYSIS_WINDOW_BYTES)
-                        analysisBuffer.order(ByteOrder.LITTLE_ENDIAN)
-                        // Copy the last ANALYSIS_WINDOW_BYTES from resampledBuffer.
-                        // bulk get into a temporary array, then put — direct
-                        // ByteBuffer doesn't have a direct slice-with-copy.
-                        val tmp = ByteArray(ANALYSIS_WINDOW_BYTES)
-                        resampledBuffer.position(sliceOffset)
-                        resampledBuffer.get(tmp)
-                        analysisBuffer.put(tmp)
-                        analysisBuffer.rewind()
-                        analysisSampleCount = ANALYSIS_WINDOW_SAMPLES
-                        Log.d(
-                            TAG,
-                            "Sliced to last ${ANALYSIS_WINDOW_SECONDS}s window: " +
-                                "$ANALYSIS_WINDOW_BYTES bytes ($ANALYSIS_WINDOW_SAMPLES samples)"
-                        )
-                    }
-
-                    val sampleCount = analysisSampleCount
-
-                    // --- LOCAL v2 TRIGGER GATE -------------------------------
-                    // Compare the current stream window against the bundled
-                    // trigger sound, using v2 explicitly (does NOT touch the
-                    // singleton). Skip the server call when the gate is below
-                    // threshold. If the trigger asset failed to load we fall
-                    // through (treat as "gate passes") so we never silently
-                    // drop into a do-nothing state — the server flow is the
-                    // safety net.
-                    val tBuf = triggerBuffer
-                    val tLen = triggerSampleCount
-                    if (tBuf != null && tLen > 0) {
-                        tBuf.rewind()
-                        val similarity = TuneURLSDK.calculateSimilarityAt(
-                            analysisBuffer, sampleCount,
-                            tBuf, tLen,
-                            TuneURLSDK.FORMAT_VERSION_V2
-                        )
-                        // Restore position for the v1 fingerprint extraction
-                        // below; calculateSimilarity advances the buffer.
-                        analysisBuffer.rewind()
-
-                        // DIAG line prescribed by v2_architecture_android.md §4.
-                        // Unconditional — this is THE log line the iOS effort
-                        // identified as the single most useful diagnostic.
-                        Log.i(
-                            "TuneURL_DIAG",
-                            "local v2 similarity=%.4f (threshold=%.2f) at t=%d"
-                                .format(similarity, TRIGGER_SIMILARITY_THRESHOLD, System.currentTimeMillis())
-                        )
-
-                        if (similarity < TRIGGER_SIMILARITY_THRESHOLD) {
-                            // No trigger in this window — don't bother the server.
-                            recordingTuneURL = false
-                            return@withContext
-                        }
-                        Log.d(TAG, "Local v2 gate PASSED (similarity=$similarity) — proceeding to server")
-
-                        // Issue 3 fix: server-call cooldown. lastServerCallTime
-                        // is set only after a SUCCESSFUL server match (see
-                        // handleSearchSuccess). If a previous successful match
-                        // fired within SERVER_CALL_COOLDOWN_MS, swallow this
-                        // local-gate pass — the manager-level match cooldown
-                        // already prevents duplicate engagement sheets, and
-                        // we don't want to thrash the server with repeated
-                        // calls for an already-matched trigger.
-                        //
-                        // Note: this does NOT block calls after the server
-                        // returned a sub-threshold match (e.g. 8%). In that
-                        // case lastServerCallTime stayed at its old value,
-                        // so the next tick — which may have a stronger
-                        // fingerprint — is free to retry.
-                        val now = System.currentTimeMillis()
-                        val sinceLast = now - lastServerCallTime
-                        if (sinceLast < SERVER_CALL_COOLDOWN_MS) {
-                            val remainingMs = SERVER_CALL_COOLDOWN_MS - sinceLast
-                            Log.d(
-                                TAG,
-                                "Server-call cooldown active (${remainingMs}ms remaining since last GOOD match) — skipping API call"
-                            )
-                            recordingTuneURL = false
-                            return@withContext
-                        }
-                        // (no eager set of lastServerCallTime here — see handleSearchSuccess)
-                    } else {
-                        Log.w(TAG, "Trigger buffer not loaded — bypassing local gate this cycle")
-                    }
-                    // ---------------------------------------------------------
-
-                    val fingerprintBytes = TuneURLSDK.extractFingerprintFromBuffer(analysisBuffer, sampleCount)
-
-                    if (fingerprintBytes != null) {
-                        val fingerprintString = fingerprintBytes.joinToString(",") {
-                            (it.toInt() and 0xff).toString()
-                        }
-
-                        Log.d(TAG, "================================================")
-                        Log.d(TAG, "FINGERPRINT EXTRACTED!")
-                        Log.d(TAG, "Size: ${fingerprintBytes.size} bytes")
-                        Log.d(TAG, "Searching via API...")
-                        Log.d(TAG, "================================================")
-
-                        searchFingerprintViaSDK(fingerprintString)
-                    } else {
-                        Log.w(TAG, "Fingerprint extraction returned null")
-                    }
-
-                } finally {
-                    resample.destroy()
-                }
-
-                recordingTuneURL = false
-
             } catch (e: CancellationException) {
-                // Issue 2 fix: cooperative cancellation must propagate.
-                recordingTuneURL = false
                 throw e
             } catch (e: Exception) {
-                Log.e(TAG, "Error processing MP3 buffer: ${e.message}", e)
-                recordingTuneURL = false
+                Log.e(TAG, "Error in post-trigger lookup: ${e.message}", e)
             }
         }
     }
 
     /**
+     * Decode the capture buffer and return the last [seconds] of audio as
+     * mono 16-bit PCM at FINGERPRINT_SAMPLE_RATE. The end of the returned
+     * array is the newest audio received from the stream.
+     */
+    private fun captureRecentAudio(seconds: Double): ShortArray? {
+        val file = dataCapture.saveCurrentBufferToFile() ?: run {
+            Log.w(TAG, "No stream data available yet")
+            return null
+        }
+
+        val decoded = try {
+            decodeToPcm(file.absolutePath)
+        } finally {
+            file.delete()
+        }
+
+        if (decoded == null || decoded.samples.isEmpty()) {
+            Log.e(TAG, "Failed to decode stream buffer")
+            return null
+        }
+
+        val mono = downmixToMono(decoded.samples, decoded.channelCount)
+
+        // Resample only the tail we need (plus a little so the filter's
+        // start-up edge falls outside the window we analyse).
+        val tailFrames = min(mono.size, ceil((seconds + 0.25) * decoded.sampleRate).toInt())
+        val tail = mono.copyOfRange(mono.size - tailFrames, mono.size)
+
+        val resampled = resampleToFingerprintRate(tail, decoded.sampleRate) ?: return null
+        val keep = min(resampled.size, (seconds * FINGERPRINT_SAMPLE_RATE).toInt())
+
+        Log.d(
+            TAG,
+            "Decoded ${decoded.samples.size / max(decoded.channelCount, 1)} frames @ ${decoded.sampleRate} Hz, " +
+                "${decoded.channelCount} ch -> ${keep} mono samples @ $FINGERPRINT_SAMPLE_RATE Hz"
+        )
+
+        return resampled.copyOfRange(resampled.size - keep, resampled.size)
+    }
+
+    /**
      * Load the bundled trigger sound (R.raw.trigger_sound, same asset as iOS),
      * decode it, mix to mono, resample to FINGERPRINT_SAMPLE_RATE, and stash
-     * the resulting PCM in [triggerBuffer] for the local gate.
-     *
-     * The asset is the same MP3 used by OTAListener; we copy it through
-     * MediaCodec via the same pipeline as the stream so the decoded byte
-     * representation is consistent.
+     * the resulting PCM in [triggerBuffer] for the local gate. Uses the same
+     * decode/downmix/resample path as the stream so both sides match.
      */
     private fun loadTriggerSound() {
         try {
@@ -417,81 +405,42 @@ class TuneURLDetector(private val context: Context) : Constants {
                 }
             }
 
-            val pcmData = decodeMp3ToPcm(triggerFile.absolutePath)
-            val sampleRate = getDecodedSampleRate(triggerFile.absolutePath)
-
-            if (pcmData == null || pcmData.isEmpty()) {
+            val decoded = decodeToPcm(triggerFile.absolutePath)
+            if (decoded == null || decoded.samples.isEmpty()) {
                 Log.e(TAG, "Failed to decode trigger sound — local gate will be bypassed")
                 return
             }
 
-            val monoData = convertToMono(pcmData)
-
-            val sourceBuffer = ByteBuffer.allocateDirect(monoData.size)
-            sourceBuffer.order(ByteOrder.LITTLE_ENDIAN)
-            sourceBuffer.put(monoData)
-            sourceBuffer.rewind()
-
-            val resampledSize = ((FINGERPRINT_SAMPLE_RATE.toDouble() / sampleRate.toDouble()) * monoData.size).toInt()
-            val resampledBuffer = ByteBuffer.allocateDirect(resampledSize)
-            resampledBuffer.order(ByteOrder.LITTLE_ENDIAN)
-
-            val resampler = NativeResampler()
-            try {
-                resampler.create(sampleRate, FINGERPRINT_SAMPLE_RATE, 2048, 1)
-                val outputLength = resampler.resampleEx(
-                    sourceBuffer, resampledBuffer, sourceBuffer.remaining()
-                )
-
-                if (outputLength > 0) {
-                    resampledBuffer.rewind()
-                    resampledBuffer.limit(outputLength)
-
-                    val held = ByteBuffer.allocateDirect(outputLength)
-                    held.order(ByteOrder.LITTLE_ENDIAN)
-                    held.put(resampledBuffer)
-                    held.rewind()
-
-                    triggerBuffer = held
-                    triggerSampleCount = outputLength / 2
-
-                    Log.i(
-                        TAG,
-                        "✓ Trigger sound loaded: $triggerSampleCount samples at $FINGERPRINT_SAMPLE_RATE Hz"
-                    )
-                } else {
-                    Log.e(TAG, "Trigger resample produced 0 bytes — local gate will be bypassed")
-                }
-            } finally {
-                resampler.destroy()
+            val mono = downmixToMono(decoded.samples, decoded.channelCount)
+            val resampled = resampleToFingerprintRate(mono, decoded.sampleRate)
+            if (resampled == null || resampled.isEmpty()) {
+                Log.e(TAG, "Trigger resample produced no audio — local gate will be bypassed")
+                return
             }
+
+            triggerBuffer = shortsToDirectBuffer(resampled)
+            triggerSampleCount = resampled.size
+
+            Log.i(
+                TAG,
+                "✓ Trigger sound loaded: ${decoded.sampleRate} Hz, ${decoded.channelCount} ch -> " +
+                    "$triggerSampleCount samples at $FINGERPRINT_SAMPLE_RATE Hz"
+            )
         } catch (e: Exception) {
             Log.e(TAG, "Error loading trigger sound — local gate will be bypassed", e)
         }
     }
 
-    private fun getDecodedSampleRate(filePath: String): Int {
-        var extractor: MediaExtractor? = null
-        try {
-            extractor = MediaExtractor()
-            extractor.setDataSource(filePath)
-
-            for (i in 0 until extractor.trackCount) {
-                val format = extractor.getTrackFormat(i)
-                val mime = format.getString(MediaFormat.KEY_MIME)
-                if (mime?.startsWith("audio/") == true) {
-                    return format.getInteger(MediaFormat.KEY_SAMPLE_RATE)
-                }
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error getting sample rate", e)
-        } finally {
-            extractor?.release()
-        }
-        return 44100
-    }
-
-    private fun decodeMp3ToPcm(filePath: String): ByteArray? {
+    /**
+     * Decode a compressed audio file (MP3/AAC) to interleaved 16-bit PCM.
+     *
+     * The sample rate and channel count are taken from the DECODER's output
+     * format, not the container: for HE-AAC the decoder outputs twice the
+     * sample rate MediaExtractor reports, and mono streams must not be
+     * treated as stereo. The loop also drains the decoder after end of input,
+     * so the newest audio at the end of the buffer isn't dropped.
+     */
+    private fun decodeToPcm(filePath: String): DecodedAudio? {
         var extractor: MediaExtractor? = null
         var codec: MediaCodec? = null
 
@@ -501,99 +450,180 @@ class TuneURLDetector(private val context: Context) : Constants {
 
             var audioTrackIndex = -1
             for (i in 0 until extractor.trackCount) {
-                val format = extractor.getTrackFormat(i)
-                val mime = format.getString(MediaFormat.KEY_MIME)
+                val mime = extractor.getTrackFormat(i).getString(MediaFormat.KEY_MIME)
                 if (mime?.startsWith("audio/") == true) {
                     audioTrackIndex = i
                     break
                 }
             }
-
             if (audioTrackIndex < 0) {
-                Log.e(TAG, "No audio track found in MP3")
+                Log.e(TAG, "No audio track found in stream buffer")
                 return null
             }
 
             extractor.selectTrack(audioTrackIndex)
-            val format = extractor.getTrackFormat(audioTrackIndex)
-            val mime = format.getString(MediaFormat.KEY_MIME) ?: ""
+            val inputFormat = extractor.getTrackFormat(audioTrackIndex)
+            val mime = inputFormat.getString(MediaFormat.KEY_MIME) ?: return null
+
+            // Container values are only a fallback until the decoder reports its
+            // real output format.
+            var sampleRate = if (inputFormat.containsKey(MediaFormat.KEY_SAMPLE_RATE))
+                inputFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE) else 44100
+            var channelCount = if (inputFormat.containsKey(MediaFormat.KEY_CHANNEL_COUNT))
+                inputFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT) else 2
+            var pcmEncoding = AudioFormat.ENCODING_PCM_16BIT
+
+            fun applyOutputFormat(format: MediaFormat) {
+                if (format.containsKey(MediaFormat.KEY_SAMPLE_RATE)) {
+                    sampleRate = format.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+                }
+                if (format.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) {
+                    channelCount = format.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+                }
+                if (format.containsKey(MediaFormat.KEY_PCM_ENCODING)) {
+                    pcmEncoding = format.getInteger(MediaFormat.KEY_PCM_ENCODING)
+                }
+            }
 
             codec = MediaCodec.createDecoderByType(mime)
-            codec.configure(format, null, null, 0)
+            codec.configure(inputFormat, null, null, 0)
             codec.start()
 
             val bufferInfo = MediaCodec.BufferInfo()
-            val pcmDataList = mutableListOf<ByteArray>()
-            var isEOS = false
+            val pcmBytes = ByteArrayOutputStream()
+            var inputDone = false
+            var outputDone = false
+            var idleAfterInputDone = 0
 
-            while (!isEOS) {
-                val inputBufferId = codec.dequeueInputBuffer(10000)
-                if (inputBufferId >= 0) {
-                    val inputBuffer = codec.getInputBuffer(inputBufferId)
-                    val sampleSize = extractor.readSampleData(inputBuffer!!, 0)
-
-                    if (sampleSize < 0) {
-                        codec.queueInputBuffer(inputBufferId, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
-                        isEOS = true
-                    } else {
-                        codec.queueInputBuffer(inputBufferId, 0, sampleSize, extractor.sampleTime, 0)
-                        extractor.advance()
+            while (!outputDone) {
+                if (!inputDone) {
+                    val inputBufferId = codec.dequeueInputBuffer(10_000)
+                    if (inputBufferId >= 0) {
+                        val inputBuffer = codec.getInputBuffer(inputBufferId)!!
+                        val sampleSize = extractor.readSampleData(inputBuffer, 0)
+                        if (sampleSize < 0) {
+                            codec.queueInputBuffer(inputBufferId, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                            inputDone = true
+                        } else {
+                            codec.queueInputBuffer(inputBufferId, 0, sampleSize, extractor.sampleTime, 0)
+                            extractor.advance()
+                        }
                     }
                 }
 
-                val outputBufferId = codec.dequeueOutputBuffer(bufferInfo, 10000)
-                if (outputBufferId >= 0) {
-                    val outputBuffer = codec.getOutputBuffer(outputBufferId)
-                    if (bufferInfo.size > 0) {
-                        val chunk = ByteArray(bufferInfo.size)
-                        outputBuffer?.get(chunk)
-                        pcmDataList.add(chunk)
+                val outputBufferId = codec.dequeueOutputBuffer(bufferInfo, 10_000)
+                when {
+                    outputBufferId >= 0 -> {
+                        if (bufferInfo.size > 0) {
+                            val outputBuffer = codec.getOutputBuffer(outputBufferId)
+                            if (outputBuffer != null) {
+                                outputBuffer.position(bufferInfo.offset)
+                                outputBuffer.limit(bufferInfo.offset + bufferInfo.size)
+                                val chunk = ByteArray(bufferInfo.size)
+                                outputBuffer.get(chunk)
+                                pcmBytes.write(chunk)
+                            }
+                        }
+                        codec.releaseOutputBuffer(outputBufferId, false)
+                        if ((bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
+                            outputDone = true
+                        }
                     }
-                    codec.releaseOutputBuffer(outputBufferId, false)
-
-                    if ((bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
-                        break
+                    outputBufferId == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                        applyOutputFormat(codec.outputFormat)
+                    }
+                    outputBufferId == MediaCodec.INFO_TRY_AGAIN_LATER -> {
+                        // Safety net for decoders that never emit the EOS flag.
+                        if (inputDone && ++idleAfterInputDone > 50) {
+                            Log.w(TAG, "Decoder did not signal end of stream; stopping drain")
+                            outputDone = true
+                        }
                     }
                 }
             }
 
-            val totalSize = pcmDataList.sumOf { it.size }
-            val pcmData = ByteArray(totalSize)
-            var offset = 0
-            for (chunk in pcmDataList) {
-                System.arraycopy(chunk, 0, pcmData, offset, chunk.size)
-                offset += chunk.size
+            // The output format is authoritative once decoding has run.
+            try {
+                applyOutputFormat(codec.outputFormat)
+            } catch (e: IllegalStateException) {
+                // Ignore; keep what INFO_OUTPUT_FORMAT_CHANGED reported.
             }
 
-            return pcmData
+            val bytes = pcmBytes.toByteArray()
+            val samples: ShortArray = if (pcmEncoding == AudioFormat.ENCODING_PCM_FLOAT) {
+                val floats = ByteBuffer.wrap(bytes).order(ByteOrder.nativeOrder()).asFloatBuffer()
+                ShortArray(floats.remaining()) { i ->
+                    (floats.get(i).coerceIn(-1f, 1f) * 32767f).toInt().toShort()
+                }
+            } else {
+                val shorts = ByteBuffer.wrap(bytes).order(ByteOrder.nativeOrder()).asShortBuffer()
+                ShortArray(shorts.remaining()).also { shorts.get(it) }
+            }
 
+            return DecodedAudio(samples, sampleRate, max(channelCount, 1))
         } catch (e: Exception) {
-            Log.e(TAG, "Error decoding MP3", e)
+            Log.e(TAG, "Error decoding audio", e)
             return null
         } finally {
-            codec?.stop()
+            try { codec?.stop() } catch (e: Exception) { /* already stopped */ }
             codec?.release()
             extractor?.release()
         }
     }
 
-    private fun convertToMono(stereoData: ByteArray): ByteArray {
-        var resultLength = stereoData.size / 2
-        if ((resultLength and 1) != 0) {
-            resultLength -= 1
+    /**
+     * Mix interleaved PCM down to mono by averaging all channels (what
+     * AVAudioConverter does on iOS). The previous implementation kept only
+     * the left channel and assumed the input was always stereo, which
+     * halved the length of mono streams.
+     */
+    private fun downmixToMono(samples: ShortArray, channelCount: Int): ShortArray {
+        if (channelCount <= 1) return samples
+        val frames = samples.size / channelCount
+        return ShortArray(frames) { frame ->
+            var sum = 0
+            val base = frame * channelCount
+            for (c in 0 until channelCount) {
+                sum += samples[base + c]
+            }
+            (sum / channelCount).toShort()
         }
+    }
 
-        val monoData = ByteArray(resultLength)
-        var dstIndex = 0
-        var i = 0
-        while (i < resultLength && dstIndex + 3 < stereoData.size) {
-            monoData[i] = stereoData[dstIndex]
-            monoData[i + 1] = stereoData[dstIndex + 1]
-            dstIndex += 4
-            i += 2
+    /**
+     * Resample mono PCM to FINGERPRINT_SAMPLE_RATE with the band-limited
+     * native resampler.
+     */
+    private fun resampleToFingerprintRate(mono: ShortArray, sampleRate: Int): ShortArray? {
+        if (mono.isEmpty()) return null
+        if (sampleRate == FINGERPRINT_SAMPLE_RATE) return mono.copyOf()
+
+        val sourceBuffer = shortsToDirectBuffer(mono)
+        val outputSamples = ceil(mono.size.toDouble() * FINGERPRINT_SAMPLE_RATE / sampleRate).toInt() + 16
+        val outputBuffer = ByteBuffer.allocateDirect(outputSamples * 2).order(ByteOrder.nativeOrder())
+
+        val resampler = NativeResampler()
+        try {
+            resampler.create(sampleRate, FINGERPRINT_SAMPLE_RATE, 2048, 1)
+            val outputBytes = resampler.resampleEx(sourceBuffer, outputBuffer, mono.size * 2)
+            if (outputBytes <= 0) {
+                Log.e(TAG, "Resampling failed ($sampleRate Hz -> $FINGERPRINT_SAMPLE_RATE Hz)")
+                return null
+            }
+            outputBuffer.rewind()
+            val shorts = outputBuffer.asShortBuffer()
+            return ShortArray(outputBytes / 2).also { shorts.get(it) }
+        } finally {
+            resampler.destroy()
         }
+    }
 
-        return monoData
+    /** Native-order direct buffer, as the JNI layer reads int16 in place. */
+    private fun shortsToDirectBuffer(samples: ShortArray): ByteBuffer {
+        val buffer = ByteBuffer.allocateDirect(samples.size * 2).order(ByteOrder.nativeOrder())
+        buffer.asShortBuffer().put(samples)
+        buffer.rewind()
+        return buffer
     }
 
     private fun searchFingerprintViaSDK(fingerprint: String) {
