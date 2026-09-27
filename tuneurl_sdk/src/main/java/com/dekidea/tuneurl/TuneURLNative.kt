@@ -60,4 +60,19 @@ internal object TuneURLNative {
         waveLength2: Int,
         emitVersion: Int
     ): Float
+
+    /**
+     * Same comparison as [getSimilarity], but also reports where in buffer 1
+     * the best match starts.
+     * @return float[3] = { similarity, mostSimilarStartTime (seconds from the
+     *         start of buffer 1), score }, or null if a fingerprint could not
+     *         be extracted.
+     */
+    external fun getSimilarityDetails(
+        byteBuffer1: ByteBuffer,
+        waveLength1: Int,
+        byteBuffer2: ByteBuffer,
+        waveLength2: Int,
+        emitVersion: Int
+    ): FloatArray?
 }
