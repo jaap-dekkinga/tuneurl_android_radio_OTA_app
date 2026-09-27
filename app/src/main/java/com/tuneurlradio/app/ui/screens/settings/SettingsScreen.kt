@@ -225,7 +225,14 @@ private fun VersionFooter() {
     val context = LocalContext.current
     val packageInfo = context.packageManager.getPackageInfo(context.packageName, 0)
     val version = packageInfo.versionName ?: "-"
+
+    // add with the other imports at the top of SettingsScreen.kt
+    import androidx.core.content.pm.PackageInfoCompat
+    
+    // line 228: replace
     val build = packageInfo.longVersionCode.toString()
+    // with
+    val build = PackageInfoCompat.getLongVersionCode(packageInfo).toString()
 
     Text(
         text = "Version $version($build)",
