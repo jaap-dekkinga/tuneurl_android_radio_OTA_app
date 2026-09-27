@@ -194,6 +194,62 @@ object TuneURLSDK {
     }
 
     /**
+     * Result of locating a reference sound (e.g. the TuneURL trigger) inside
+     * a longer audio window.
+     *
+     * @property similarity 0.0..1.0, same value as [calculateSimilarityAt]
+     * @property mostSimilarStartTime seconds from the start of the searched
+     *           window where the best match begins
+     * @property score matched features per frame
+     */
+    data class SimilarityMatch(
+        val similarity: Float,
+        val mostSimilarStartTime: Float,
+        val score: Float
+    )
+
+    /**
+     * Compare [buffer1] (the window being searched) against [buffer2] (the
+     * reference sound) with an explicit format version, and report where in
+     * [buffer1] the best match was found. This is what the iOS StreamDetector
+     * uses to work out how long ago the trigger played.
+     *
+     * Returns null if the SDK isn't initialized or a fingerprint couldn't be
+     * extracted.
+     */
+    fun findSimilarityAt(
+        buffer1: ByteBuffer,
+        length1: Int,
+        buffer2: ByteBuffer,
+        length2: Int,
+        version: Int
+    ): SimilarityMatch? {
+        if (!isInitialized) {
+            Log.e(TAG, "SDK not initialized")
+            return null
+        }
+        require(
+            version == TuneURLNative.FORMAT_VERSION_V1 ||
+                version == TuneURLNative.FORMAT_VERSION_V2
+        ) { "Unsupported format version: $version" }
+
+        return try {
+            val values = TuneURLNative.getSimilarityDetails(
+                buffer1, length1, buffer2, length2, version
+            ) ?: return null
+            if (values.size < 3) return null
+            SimilarityMatch(
+                similarity = values[0],
+                mostSimilarStartTime = values[1],
+                score = values[2]
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "Error calculating similarity details (explicit v$version)", e)
+            null
+        }
+    }
+
+    /**
      * Convert fingerprint ByteArray to hex string for API transmission
      */
     fun fingerprintToHexString(fingerprint: ByteArray): String {
