@@ -504,6 +504,11 @@ class OTAListener(private val context: Context) : Constants {
     private fun searchForTrigger(triggerBuf: ByteBuffer, logSuffix: String): TriggerLook? {
         // Most recent audio only, not the whole 10 s buffer.
         val (pcmData, endPos) = copyRecentAudio(TRIGGER_SEARCH_WINDOW_SECONDS) ?: return null
+        // How loud the microphone audio is. Without this a silent microphone
+        // (e.g. an emulator not wired to the host mic) and "nothing matched"
+        // look identical in the log: both read similarity=0.
+        val (peak, levelDb) = measureLevel(pcmData)
+
         val (window, windowSamples) = resampleToFingerprintRate(pcmData) ?: return null
         if (windowSamples < triggerSampleCount) {
             // Less than one trigger length recorded so far.
@@ -531,17 +536,45 @@ class OTAListener(private val context: Context) : Constants {
         // unchanged so existing log filters keep working.
         Log.i(
             "TuneURL_DIAG",
-            "OTA local v2 similarity=%.4f (threshold=%.2f) triggerStart=%.2fs window=%.2fs positions=%d%s"
+            "OTA local v2 similarity=%.4f (threshold=%.2f) triggerStart=%.2fs window=%.2fs positions=%d level=%.1fdBFS peak=%d%s"
                 .format(
                     similarity, TRIGGER_SIMILARITY_THRESHOLD,
                     if (similarity > 0f) triggerStartSeconds else -1.0,
-                    windowSeconds, match?.positionsChecked ?: 0, logSuffix
+                    windowSeconds, match?.positionsChecked ?: 0, levelDb, peak, logSuffix
                 )
         )
+        if (peak < SILENCE_PEAK) {
+            Log.w(TAG, "Microphone audio is silent (peak=$peak of 32767) — nothing can be detected")
+        }
 
         if (match == null) return null
         val windowStartPos = endPos - pcmData.size
         return TriggerLook(similarity, windowStartPos + secondsToBytes(triggerStartSeconds))
+    }
+
+    // Below this peak (of 32767) the microphone is treated as silent.
+    private val SILENCE_PEAK = 16
+
+    /**
+     * Peak sample value (0..32767) and RMS level in dB relative to full scale
+     * (0 dBFS = as loud as 16-bit audio can be; silence is reported as -120).
+     */
+    private fun measureLevel(pcmData: ByteArray): Pair<Int, Double> {
+        var peak = 0
+        var sumSquares = 0.0
+        val samples = pcmData.size / 2
+        var i = 0
+        while (i + 1 < pcmData.size) {
+            // 16-bit little-endian
+            val sample = (pcmData[i].toInt() and 0xff) or (pcmData[i + 1].toInt() shl 8)
+            val magnitude = if (sample < 0) -sample else sample
+            if (magnitude > peak) peak = magnitude
+            sumSquares += sample.toDouble() * sample.toDouble()
+            i += 2
+        }
+        if (samples == 0 || sumSquares <= 0.0) return Pair(peak, -120.0)
+        val rms = Math.sqrt(sumSquares / samples)
+        return Pair(minOf(peak, 32767), 20.0 * Math.log10(rms / 32768.0))
     }
 
     private val BYTES_PER_SECOND = SAMPLE_RATE * 2  // 16-bit mono
