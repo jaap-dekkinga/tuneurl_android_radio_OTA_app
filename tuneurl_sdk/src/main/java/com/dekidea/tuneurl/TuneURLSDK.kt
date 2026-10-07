@@ -16,6 +16,9 @@ import java.nio.ByteBuffer
 object TuneURLSDK {
 
     private const val TAG = "TuneURLSDK"
+
+    /** Sample rate every fingerprint operation expects (FingerprintProperties). */
+    private const val FINGERPRINT_SAMPLE_RATE = 10240.0
     private var isInitialized = false
 
     /**
@@ -245,6 +248,116 @@ object TuneURLSDK {
             )
         } catch (e: Exception) {
             Log.e(TAG, "Error calculating similarity details (explicit v$version)", e)
+            null
+        }
+    }
+
+    /**
+     * Result of sliding a reference sound across a longer audio window.
+     *
+     * @property similarity best similarity found, 0.0..1.0
+     * @property offsetSamples where in the window the best-matching slice
+     *           starts, in samples from the start of the window
+     * @property startSeconds where in the window the reference sound itself
+     *           starts, in seconds from the start of the window: the slice
+     *           offset refined by the position the native compare reports
+     *           inside that slice. Can be slightly negative when the sound
+     *           began just before the window. Only meaningful when
+     *           [similarity] is above the caller's threshold.
+     * @property positionsChecked how many slices were compared
+     */
+    data class SlidingMatch(
+        val similarity: Float,
+        val offsetSamples: Int,
+        val startSeconds: Double,
+        val positionsChecked: Int
+    )
+
+    /**
+     * Look for [reference] (e.g. the TuneURL trigger) anywhere inside [window]
+     * by comparing it with every reference-length slice of the window, moving
+     * [hopSamples] at a time.
+     *
+     * Use this instead of [calculateSimilarityAt] / [findSimilarityAt] when
+     * the window is longer than the reference: the native compare truncates
+     * both fingerprints to the size of the smaller one, so a direct compare
+     * only examines the START of the window. Slices of reference length are
+     * not affected by that truncation.
+     *
+     * Both buffers must be direct ByteBuffers of 16-bit PCM at the fingerprint
+     * sample rate. Returns null if the SDK isn't initialized, the window is
+     * shorter than the reference, or a buffer isn't direct.
+     */
+    fun slideSimilarityAt(
+        window: ByteBuffer,
+        windowSamples: Int,
+        reference: ByteBuffer,
+        referenceSamples: Int,
+        hopSamples: Int,
+        version: Int
+    ): SlidingMatch? {
+        if (!isInitialized) {
+            Log.e(TAG, "SDK not initialized")
+            return null
+        }
+        require(
+            version == TuneURLNative.FORMAT_VERSION_V1 ||
+                version == TuneURLNative.FORMAT_VERSION_V2
+        ) { "Unsupported format version: $version" }
+        require(hopSamples > 0) { "hopSamples must be positive" }
+
+        if (referenceSamples <= 0 || windowSamples < referenceSamples) return null
+        if (!window.isDirect || !reference.isDirect) {
+            Log.e(TAG, "slideSimilarityAt needs direct ByteBuffers")
+            return null
+        }
+        if (window.capacity() < windowSamples * 2 || reference.capacity() < referenceSamples * 2) {
+            Log.e(TAG, "slideSimilarityAt: buffer smaller than the stated sample count")
+            return null
+        }
+
+        return try {
+            // The native side reads from the start of a direct buffer, so each
+            // slice is copied into its own buffer rather than passed by offset.
+            val sliceBytes = referenceSamples * 2
+            val slice = ByteBuffer.allocateDirect(sliceBytes)
+
+            var best = 0f
+            var bestOffset = 0
+            var bestStartInSlice = 0f
+            var positions = 0
+            var offset = 0
+            while (offset + referenceSamples <= windowSamples) {
+                val source = window.duplicate()
+                source.limit(offset * 2 + sliceBytes)
+                source.position(offset * 2)
+                slice.clear()
+                slice.put(source)
+
+                val values = TuneURLNative.getSimilarityDetails(
+                    slice, referenceSamples, reference, referenceSamples, version
+                )
+                if (values != null && values.size >= 2 && values[0] > best) {
+                    best = values[0]
+                    bestOffset = offset
+                    bestStartInSlice = values[1]
+                }
+                positions++
+                offset += hopSamples
+            }
+            // The native start time is unset (a huge negative number) when
+            // nothing matched; ignore anything outside one reference length.
+            val referenceSeconds = referenceSamples / FINGERPRINT_SAMPLE_RATE
+            val startInSlice = bestStartInSlice.toDouble()
+                .takeIf { best > 0f && it >= -referenceSeconds && it <= referenceSeconds } ?: 0.0
+            SlidingMatch(
+                similarity = best,
+                offsetSamples = bestOffset,
+                startSeconds = bestOffset / FINGERPRINT_SAMPLE_RATE + startInSlice,
+                positionsChecked = positions
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "Error in sliding similarity (explicit v$version)", e)
             null
         }
     }
