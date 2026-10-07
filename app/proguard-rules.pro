@@ -5,17 +5,19 @@
 # For more details, see
 #   http://developer.android.com/guide/developing/tools/proguard.html
 
-# If your project uses WebView with JS, uncomment the following
-# and specify the fully qualified class name to the JavaScript interface
-# class:
-#-keepclassmembers class fqcn.of.javascript.interface.for.webview {
-#   public *;
-#}
+# Keep TuneURL SDK classes (the native library looks them up by name)
+-keep class com.dekidea.tuneurl.** { *; }
 
-# Uncomment this to preserve the line number information for
-# debugging stack traces.
-#-keepattributes SourceFile,LineNumberTable
+# Keep native methods
+-keepclasseswithmembernames class * {
+    native <methods>;
+}
 
-# If you keep the line number information, uncomment this to
-# hide the original source file name.
-#-renamesourcefileattribute SourceFile
+# stations.json is read into these classes by field name.
+-keep class com.tuneurlradio.app.domain.model.** { *; }
+-keepattributes Signature, *Annotation*
+
+# Keep readable line numbers in crash reports,
+# and hide the original source file name.
+-keepattributes SourceFile, LineNumberTable
+-renamesourcefileattribute SourceFile
