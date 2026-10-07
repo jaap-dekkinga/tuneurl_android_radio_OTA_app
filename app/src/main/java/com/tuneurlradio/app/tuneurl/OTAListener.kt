@@ -46,6 +46,34 @@ class OTAListener(private val context: Context) : Constants {
     private val TRIGGER_CHECK_INTERVAL_MS = 1000L  // Check for trigger every 1 second
     private val TRIGGER_SIMILARITY_THRESHOLD = 0.15f  // 15% similarity to detect trigger
     private val MIN_MATCH_PERCENTAGE = 10f  // Lower threshold since we pre-filter with trigger
+
+    // Local trigger search. The trigger is slid across the most recent
+    // TRIGGER_SEARCH_WINDOW_SECONDS of microphone audio in steps of
+    // TRIGGER_SLIDE_HOP_SECONDS, and each trigger-length slice is compared
+    // with the trigger on its own.
+    //
+    // Why: the native compare truncates both fingerprints to the size of the
+    // smaller one, so comparing the whole 10 s buffer against the 1.4 s
+    // trigger only ever looked at the OLDEST ~1.3 s of the buffer. A trigger
+    // was therefore only noticed ~9 s after it played. Slicing the audio to
+    // trigger length makes the truncation harmless.
+    private val TRIGGER_SEARCH_WINDOW_SECONDS = 3.0
+    private val TRIGGER_SLIDE_HOP_SECONDS = 0.25
+
+    // With the sliding search one trigger stays visible for ~3.5 s, i.e. on
+    // several consecutive checks. Ignore further hits for this long after a
+    // detection so one trigger is recognised once.
+    private val TRIGGER_COOLDOWN_MS = 6_000L
+
+    // Content capture after a trigger: same arithmetic as the stream path
+    // (TuneURLDetector) and iOS. The capture starts TRIGGER_SOUND_DURATION
+    // after the trigger START and is IDENTIFIABLE_AUDIO_DURATION long.
+    private val TRIGGER_SOUND_DURATION_SECONDS = 2.0
+    private val IDENTIFIABLE_AUDIO_DURATION_SECONDS = 5.0
+    private val CONTENT_CAPTURE_TIMEOUT_MS = 10_000L
+
+    // After a first hit, look once more this much later (see checkForTrigger).
+    private val TRIGGER_RELOOK_DELAY_MS = 1_000L
     
     private val bufferSize = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL_CONFIG, AUDIO_FORMAT)
     
@@ -61,11 +89,16 @@ class OTAListener(private val context: Context) : Constants {
     private val MAX_BUFFER_SIZE = SAMPLE_RATE * 2 * 10 // 10 seconds of audio
     private val bufferLock = Any()
     
-    // Capture additional audio after trigger detected
-    private var isCapturingAfterTrigger = false
-    private var captureStartTime = 0L
-    private val CAPTURE_DURATION_MS = 3000L // Capture 3 more seconds after trigger
-    
+    // Total microphone bytes recorded since listening started (guarded by
+    // bufferLock). Lets us address audio by absolute position, so "the 5 s
+    // after the trigger" can be cut out exactly, independent of wall-clock
+    // jitter. The rolling buffer holds [totalBytesCaptured - currentBufferSize,
+    // totalBytesCaptured).
+    private var totalBytesCaptured = 0L
+
+    // When the last trigger was recognised locally (for TRIGGER_COOLDOWN_MS).
+    @Volatile private var lastTriggerDetectedAt = 0L
+
     // Trigger sound data (pre-loaded and resampled)
     private var triggerBuffer: ByteBuffer? = null
     private var triggerSampleCount = 0
@@ -209,7 +242,9 @@ class OTAListener(private val context: Context) : Constants {
             synchronized(bufferLock) {
                 audioBuffer.clear()
                 currentBufferSize = 0
+                totalBytesCaptured = 0L
             }
+            lastTriggerDetectedAt = 0L
             lastTriggerCheckTime = System.currentTimeMillis()
             
             audioRecord?.startRecording()
@@ -328,6 +363,7 @@ class OTAListener(private val context: Context) : Constants {
         synchronized(bufferLock) {
             audioBuffer.add(chunk)
             currentBufferSize += chunk.size
+            totalBytesCaptured += chunk.size
             
             // Keep buffer at max size (rolling window)
             while (currentBufferSize > MAX_BUFFER_SIZE && audioBuffer.isNotEmpty()) {
@@ -363,152 +399,231 @@ class OTAListener(private val context: Context) : Constants {
     }
     
     /**
-     * Check if trigger sound is present in current audio buffer
+     * Check whether the trigger sound is present in the most recent microphone
+     * audio. Runs entirely on the device; the server is only contacted after
+     * a trigger has been recognised here.
      */
     private suspend fun checkForTrigger() {
         withContext(Dispatchers.IO) {
             try {
-                val triggerBuf = triggerBuffer ?: run {
-                    isProcessing = false
+                val triggerBuf = triggerBuffer ?: return@withContext
+                if (triggerSampleCount <= 0) return@withContext
+
+                // One trigger is visible on several consecutive checks.
+                val now = System.currentTimeMillis()
+                if (now - lastTriggerDetectedAt < TRIGGER_COOLDOWN_MS) return@withContext
+
+                val firstLook = searchForTrigger(triggerBuf, "") ?: return@withContext
+                if (firstLook.similarity < TRIGGER_SIMILARITY_THRESHOLD) {
                     return@withContext
                 }
-                
-                // Get current audio data
-                val pcmData: ByteArray
-                synchronized(bufferLock) {
-                    if (audioBuffer.isEmpty()) {
-                        isProcessing = false
-                        return@withContext
-                    }
-                    
-                    val totalSize = audioBuffer.sumOf { it.size }
-                    pcmData = ByteArray(totalSize)
-                    var offset = 0
-                    for (chunk in audioBuffer) {
-                        System.arraycopy(chunk, 0, pcmData, offset, chunk.size)
-                        offset += chunk.size
-                    }
-                }
-                
-                // Resample captured audio to fingerprint sample rate
-                val sourceBuffer = ByteBuffer.allocateDirect(pcmData.size)
-                sourceBuffer.order(ByteOrder.LITTLE_ENDIAN)
-                sourceBuffer.put(pcmData)
-                sourceBuffer.rewind()
-                
-                val resampledSize = ((FINGERPRINT_SAMPLE_RATE.toDouble() / SAMPLE_RATE.toDouble()) * pcmData.size).toInt()
-                val resampledBuffer = ByteBuffer.allocateDirect(resampledSize)
-                resampledBuffer.order(ByteOrder.LITTLE_ENDIAN)
-                
-                val resampler = NativeResampler()
-                try {
-                    resampler.create(SAMPLE_RATE, FINGERPRINT_SAMPLE_RATE, 2048, 1)
-                    val outputLength = resampler.resampleEx(sourceBuffer, resampledBuffer, sourceBuffer.remaining())
-                    
-                    if (outputLength <= 0) {
-                        isProcessing = false
-                        return@withContext
-                    }
-                    
-                    resampledBuffer.rewind()
-                    val capturedSampleCount = outputLength / 2
-                    
-                    // Compare with trigger sound using SDK.
-                    // Use the explicit-version overload pinned to v2 — the local
-                    // trigger gate is a v2 feature and must NOT inherit whatever
-                    // the singleton was last set to (which can be v1 if the
-                    // stream path ran earlier in the session).
-                    triggerBuf.rewind()
-                    val similarity = TuneURLSDK.calculateSimilarityAt(
-                        resampledBuffer, capturedSampleCount,
-                        triggerBuf, triggerSampleCount,
-                        TuneURLSDK.FORMAT_VERSION_V2
-                    )
 
-                    Log.i(
-                        "TuneURL_DIAG",
-                        "OTA local v2 similarity=%.4f (threshold=%.2f)"
-                            .format(similarity, TRIGGER_SIMILARITY_THRESHOLD)
-                    )
-                    
-                    if (similarity >= TRIGGER_SIMILARITY_THRESHOLD) {
-                        Log.d(TAG, "================================================")
-                        Log.d(TAG, "🎯 TRIGGER DETECTED! Similarity: ${(similarity * 100).toInt()}%")
-                        Log.d(TAG, "Capturing additional audio for better fingerprinting...")
-                        Log.d(TAG, "================================================")
-                        
-                        // Start capturing more audio after trigger
-                        isCapturingAfterTrigger = true
-                        captureStartTime = System.currentTimeMillis()
-                        
-                        // Wait for additional audio capture
-                        delay(CAPTURE_DURATION_MS)
-                        isCapturingAfterTrigger = false
-                        
-                        // Now extract fingerprint from the full buffer
-                        val fullPcmData: ByteArray
-                        synchronized(bufferLock) {
-                            val totalSize = audioBuffer.sumOf { it.size }
-                            fullPcmData = ByteArray(totalSize)
-                            var offset = 0
-                            for (chunk in audioBuffer) {
-                                System.arraycopy(chunk, 0, fullPcmData, offset, chunk.size)
-                                offset += chunk.size
-                            }
-                        }
-                        
-                        Log.d(TAG, "Captured ${fullPcmData.size} bytes (${fullPcmData.size / (SAMPLE_RATE * 2)} seconds)")
-                        
-                        // Resample full captured audio
-                        val fullSourceBuffer = ByteBuffer.allocateDirect(fullPcmData.size)
-                        fullSourceBuffer.order(ByteOrder.LITTLE_ENDIAN)
-                        fullSourceBuffer.put(fullPcmData)
-                        fullSourceBuffer.rewind()
-                        
-                        val fullResampledSize = ((FINGERPRINT_SAMPLE_RATE.toDouble() / SAMPLE_RATE.toDouble()) * fullPcmData.size).toInt()
-                        val fullResampledBuffer = ByteBuffer.allocateDirect(fullResampledSize)
-                        fullResampledBuffer.order(ByteOrder.LITTLE_ENDIAN)
-                        
-                        val fullResampler = NativeResampler()
-                        try {
-                            fullResampler.create(SAMPLE_RATE, FINGERPRINT_SAMPLE_RATE, 2048, 1)
-                            val fullOutputLength = fullResampler.resampleEx(fullSourceBuffer, fullResampledBuffer, fullSourceBuffer.remaining())
-                            
-                            if (fullOutputLength > 0) {
-                                fullResampledBuffer.rewind()
-                                val fullSampleCount = fullOutputLength / 2
-                                
-                                val fingerprintBytes = TuneURLSDK.extractFingerprintFromBuffer(fullResampledBuffer, fullSampleCount)
-                                
-                                if (fingerprintBytes != null) {
-                                    Log.d(TAG, "Fingerprint extracted: ${fingerprintBytes.size} bytes from $fullSampleCount samples")
-                                    val fingerprintString = fingerprintBytes.joinToString(",") {
-                                        (it.toInt() and 0xff).toString()
-                                    }
-                                    searchFingerprintViaSDK(fingerprintString)
-                                }
-                            }
-                        } finally {
-                            fullResampler.destroy()
-                        }
-                    }
-                    
-                } finally {
-                    resampler.destroy()
-                }
-                
-                isProcessing = false
+                lastTriggerDetectedAt = now
 
+                // The first hit often catches the trigger while it is still
+                // only partly inside the window, which places its start
+                // imprecisely. Look once more when it is fully in view and
+                // keep whichever look matched better. This costs no time: the
+                // audio that follows the trigger still has to be recorded.
+                delay(TRIGGER_RELOOK_DELAY_MS)
+                val secondLook = searchForTrigger(triggerBuf, " (re-look)")
+                val hit = if (secondLook != null && secondLook.similarity > firstLook.similarity) {
+                    secondLook
+                } else {
+                    firstLook
+                }
+
+                val triggerStartPos = hit.triggerStartPos
+                val contentStartPos = triggerStartPos + secondsToBytes(TRIGGER_SOUND_DURATION_SECONDS)
+                val contentEndPos = contentStartPos + secondsToBytes(IDENTIFIABLE_AUDIO_DURATION_SECONDS)
+
+                Log.d(TAG, "================================================")
+                Log.d(TAG, "🎯 TRIGGER DETECTED! Similarity: ${(hit.similarity * 100).toInt()}%")
+                Log.d(
+                    TAG,
+                    "Trigger started %.2fs ago; capturing %.1fs of audio after it".format(
+                        (capturedBytes() - triggerStartPos).toDouble() / BYTES_PER_SECOND,
+                        IDENTIFIABLE_AUDIO_DURATION_SECONDS
+                    )
+                )
+                Log.d(TAG, "================================================")
+
+                // Wait until the audio that follows the trigger has been
+                // recorded (delay() is cancellable, so stopListening ends this).
+                val deadline = System.currentTimeMillis() + CONTENT_CAPTURE_TIMEOUT_MS
+                while (isListening &&
+                    capturedBytes() < contentEndPos &&
+                    System.currentTimeMillis() < deadline
+                ) {
+                    delay(100)
+                }
+                if (!isListening) return@withContext
+
+                val contentPcm = copyAudioRange(contentStartPos, contentEndPos)
+                if (contentPcm == null) {
+                    Log.w(TAG, "Audio after the trigger is not available — skipping lookup")
+                    return@withContext
+                }
+
+                val (content, contentSamples) = resampleToFingerprintRate(contentPcm)
+                    ?: return@withContext
+
+                val fingerprintBytes = TuneURLSDK.extractFingerprintFromBuffer(content, contentSamples)
+                if (fingerprintBytes != null) {
+                    Log.d(TAG, "Fingerprint extracted: ${fingerprintBytes.size} bytes from $contentSamples samples")
+                    val fingerprintString = fingerprintBytes.joinToString(",") {
+                        (it.toInt() and 0xff).toString()
+                    }
+                    searchFingerprintViaSDK(fingerprintString)
+                }
             } catch (e: CancellationException) {
                 // Issue 2 fix: cooperative cancellation must propagate so the
                 // outer detection loop (and any code awaiting this scope) sees
                 // the cancellation rather than continuing as if nothing happened.
-                isProcessing = false
                 throw e
             } catch (e: Exception) {
                 Log.e(TAG, "Error checking for trigger: ${e.message}", e)
+            } finally {
                 isProcessing = false
             }
+        }
+    }
+
+    /** One local search: how well the trigger matched and where it starts. */
+    private data class TriggerLook(
+        val similarity: Float,
+        /** Absolute position (bytes since listening started) of the trigger start. */
+        val triggerStartPos: Long
+    )
+
+    /**
+     * Slide the trigger across the most recent TRIGGER_SEARCH_WINDOW_SECONDS
+     * of microphone audio and log the result. Returns null when there isn't
+     * enough audio yet or the audio couldn't be prepared.
+     */
+    private fun searchForTrigger(triggerBuf: ByteBuffer, logSuffix: String): TriggerLook? {
+        // Most recent audio only, not the whole 10 s buffer.
+        val (pcmData, endPos) = copyRecentAudio(TRIGGER_SEARCH_WINDOW_SECONDS) ?: return null
+        val (window, windowSamples) = resampleToFingerprintRate(pcmData) ?: return null
+        if (windowSamples < triggerSampleCount) {
+            // Less than one trigger length recorded so far.
+            return null
+        }
+
+        // The local trigger gate is a v2 feature and must NOT inherit whatever
+        // the singleton was last set to (which can be v1 if the stream path
+        // ran earlier in the session), so the version is passed explicitly.
+        val hopSamples = (TRIGGER_SLIDE_HOP_SECONDS * FINGERPRINT_SAMPLE_RATE).toInt()
+        val match = TuneURLSDK.slideSimilarityAt(
+            window, windowSamples,
+            triggerBuf, triggerSampleCount,
+            hopSamples,
+            TuneURLSDK.FORMAT_VERSION_V2
+        )
+
+        val similarity = match?.similarity ?: -1f
+        val windowSeconds = windowSamples.toDouble() / FINGERPRINT_SAMPLE_RATE
+        // Where the trigger starts inside the window (slice offset refined by
+        // the position the compare reports in that slice).
+        val triggerStartSeconds = match?.startSeconds ?: 0.0
+
+        // Unconditional diagnostic, one line per search. The prefix is
+        // unchanged so existing log filters keep working.
+        Log.i(
+            "TuneURL_DIAG",
+            "OTA local v2 similarity=%.4f (threshold=%.2f) triggerStart=%.2fs window=%.2fs positions=%d%s"
+                .format(
+                    similarity, TRIGGER_SIMILARITY_THRESHOLD,
+                    if (similarity > 0f) triggerStartSeconds else -1.0,
+                    windowSeconds, match?.positionsChecked ?: 0, logSuffix
+                )
+        )
+
+        if (match == null) return null
+        val windowStartPos = endPos - pcmData.size
+        return TriggerLook(similarity, windowStartPos + secondsToBytes(triggerStartSeconds))
+    }
+
+    private val BYTES_PER_SECOND = SAMPLE_RATE * 2  // 16-bit mono
+
+    /** Whole 16-bit samples only, so positions never split a sample. */
+    private fun secondsToBytes(seconds: Double): Long = (seconds * SAMPLE_RATE).toLong() * 2
+
+    private fun capturedBytes(): Long = synchronized(bufferLock) { totalBytesCaptured }
+
+    /**
+     * Copy the most recent [seconds] of microphone audio (less if that much
+     * hasn't been recorded yet). Returns the audio and the absolute position
+     * of its end, or null if nothing has been recorded.
+     */
+    private fun copyRecentAudio(seconds: Double): Pair<ByteArray, Long>? {
+        synchronized(bufferLock) {
+            val endPos = totalBytesCaptured and 1L.inv()
+            val bufferStart = totalBytesCaptured - currentBufferSize
+            val available = (endPos - bufferStart) and 1L.inv()
+            val wanted = minOf(secondsToBytes(seconds), available)
+            if (wanted <= 0L) return null
+            val data = copyAudioRange(endPos - wanted, endPos) ?: return null
+            return Pair(data, endPos)
+        }
+    }
+
+    /**
+     * Copy microphone audio between two absolute byte positions (counted from
+     * the start of listening). Returns null if part of that range has already
+     * left the rolling buffer or has not been recorded yet.
+     */
+    private fun copyAudioRange(fromPos: Long, toPos: Long): ByteArray? {
+        synchronized(bufferLock) {
+            val bufferStart = totalBytesCaptured - currentBufferSize
+            if (toPos <= fromPos || fromPos < bufferStart || toPos > totalBytesCaptured) {
+                return null
+            }
+            val out = ByteArray((toPos - fromPos).toInt())
+            var chunkStart = bufferStart
+            for (chunk in audioBuffer) {
+                val chunkEnd = chunkStart + chunk.size
+                if (chunkEnd > fromPos && chunkStart < toPos) {
+                    val from = maxOf(fromPos, chunkStart)
+                    val to = minOf(toPos, chunkEnd)
+                    System.arraycopy(
+                        chunk, (from - chunkStart).toInt(),
+                        out, (from - fromPos).toInt(),
+                        (to - from).toInt()
+                    )
+                }
+                chunkStart = chunkEnd
+                if (chunkStart >= toPos) break
+            }
+            return out
+        }
+    }
+
+    /**
+     * Resample 44.1 kHz 16-bit mono PCM to the fingerprint sample rate.
+     * Returns a direct buffer and the number of samples in it.
+     */
+    private fun resampleToFingerprintRate(pcmData: ByteArray): Pair<ByteBuffer, Int>? {
+        val sourceBuffer = ByteBuffer.allocateDirect(pcmData.size)
+        sourceBuffer.order(ByteOrder.LITTLE_ENDIAN)
+        sourceBuffer.put(pcmData)
+        sourceBuffer.rewind()
+
+        val resampledSize =
+            ((FINGERPRINT_SAMPLE_RATE.toDouble() / SAMPLE_RATE.toDouble()) * pcmData.size).toInt() and 1.inv()
+        if (resampledSize <= 0) return null
+        val resampledBuffer = ByteBuffer.allocateDirect(resampledSize)
+        resampledBuffer.order(ByteOrder.LITTLE_ENDIAN)
+
+        val resampler = NativeResampler()
+        try {
+            resampler.create(SAMPLE_RATE, FINGERPRINT_SAMPLE_RATE, 2048, 1)
+            val outputLength = resampler.resampleEx(sourceBuffer, resampledBuffer, sourceBuffer.remaining())
+            if (outputLength <= 0) return null
+            resampledBuffer.rewind()
+            return Pair(resampledBuffer, outputLength / 2)
+        } finally {
+            resampler.destroy()
         }
     }
 
