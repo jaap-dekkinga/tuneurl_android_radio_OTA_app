@@ -250,10 +250,14 @@ class MainViewModel @Inject constructor(
      */
     private fun showEngagementFromNotification(match: TuneURLMatch) {
         // Update state directly to show engagement sheet immediately
-        // This bypasses TuneURLManager to ensure the sheet shows
+        // This bypasses TuneURLManager to ensure the sheet shows.
+        //
+        // Don't open the full-screen player here: the sheet is drawn over the
+        // whole app anyway, and when the match came from microphone listening
+        // there is no station, so the player showed an empty "-" / OFFLINE
+        // screen once the sheet was closed.
         updateState { 
             copy(
-                expandedPlayer = true,
                 currentMatch = match,
                 showEngagementSheet = true
             ) 
