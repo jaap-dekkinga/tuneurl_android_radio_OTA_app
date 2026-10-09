@@ -128,6 +128,36 @@ object TuneURLSDK {
     }
 
     /**
+     * Extract a fingerprint from a buffer (16-bit PCM at the fingerprint
+     * sample rate) with an EXPLICIT format version, ignoring the SDK-wide
+     * setting. Use this for fingerprints sent to the match server, which
+     * expects V1, so the result doesn't depend on which code path last
+     * called [setFormatVersion].
+     */
+    fun extractFingerprintFromBufferAt(audioBuffer: ByteBuffer, waveLength: Int, version: Int): ByteArray? {
+        if (!isInitialized) {
+            Log.e(TAG, "SDK not initialized")
+            return null
+        }
+        require(
+            version == TuneURLNative.FORMAT_VERSION_V1 ||
+                version == TuneURLNative.FORMAT_VERSION_V2
+        ) { "Unsupported format version: $version" }
+        return try {
+            val fingerprint = TuneURLNative.extractFingerprint(audioBuffer, waveLength, version)
+            if (fingerprint != null && fingerprint.isNotEmpty()) {
+                Log.d(TAG, "✓ Fingerprint extracted (explicit v$version): ${fingerprint.size} bytes")
+            } else {
+                Log.w(TAG, "Fingerprint extraction returned empty result (explicit v$version)")
+            }
+            fingerprint
+        } catch (e: Exception) {
+            Log.e(TAG, "Error extracting fingerprint (explicit v$version)", e)
+            null
+        }
+    }
+
+    /**
      * Calculate similarity between two audio buffers. Both buffers are fingerprinted
      * with the current format version. Mismatched versions return 0.0 (C++ silently
      * rejects). Returns -1.0 on a Kotlin-level error.
