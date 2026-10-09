@@ -7,6 +7,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.MediaCodec
 import android.media.MediaExtractor
@@ -19,10 +20,15 @@ import com.dekidea.tuneurl.TuneURLSDK
 import com.dekidea.tuneurl.service.APIService
 import com.dekidea.tuneurl.util.Constants
 import com.google.gson.JsonParser
+import com.tuneurlradio.app.BuildConfig
 import com.tuneurlradio.app.R
 import kotlinx.coroutines.*
 import java.io.File
 import java.io.FileOutputStream
+import java.io.RandomAccessFile
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
@@ -44,7 +50,9 @@ class OTAListener(private val context: Context) : Constants {
     
     // Detection settings
     private val TRIGGER_CHECK_INTERVAL_MS = 1000L  // Check for trigger every 1 second
-    private val TRIGGER_SIMILARITY_THRESHOLD = 0.15f  // 15% similarity to detect trigger
+    // Scores come in steps of 0.04 (0.08, 0.12, 0.16, ...), so 0.12 accepts
+    // one step lower than the previous 0.15 (which really meant 0.16).
+    private val TRIGGER_SIMILARITY_THRESHOLD = 0.12f
     private val MIN_MATCH_PERCENTAGE = 10f  // Lower threshold since we pre-filter with trigger
 
     // Local trigger search. The trigger is slid across the most recent
@@ -58,7 +66,7 @@ class OTAListener(private val context: Context) : Constants {
     // was therefore only noticed ~9 s after it played. Slicing the audio to
     // trigger length makes the truncation harmless.
     private val TRIGGER_SEARCH_WINDOW_SECONDS = 3.0
-    private val TRIGGER_SLIDE_HOP_SECONDS = 0.25
+    private val TRIGGER_SLIDE_HOP_SECONDS = 0.125
 
     // With the sliding search one trigger stays visible for ~3.5 s, i.e. on
     // several consecutive checks. Ignore further hits for this long after a
@@ -225,15 +233,8 @@ class OTAListener(private val context: Context) : Constants {
         ensureSearchReceiverRegistered()
         
         try {
-            audioRecord = AudioRecord(
-                MediaRecorder.AudioSource.MIC,
-                SAMPLE_RATE,
-                CHANNEL_CONFIG,
-                AUDIO_FORMAT,
-                bufferSize * 2
-            )
-            
-            if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
+            audioRecord = createAudioRecord()
+            if (audioRecord == null) {
                 Log.e(TAG, "AudioRecord initialization failed")
                 return
             }
@@ -248,6 +249,7 @@ class OTAListener(private val context: Context) : Constants {
             lastTriggerCheckTime = System.currentTimeMillis()
             
             audioRecord?.startRecording()
+            debugRecorder.start()
             startRecordingLoop()
             startTriggerDetectionLoop()
             
@@ -258,6 +260,49 @@ class OTAListener(private val context: Context) : Constants {
         } catch (e: Exception) {
             Log.e(TAG, "Error starting OTA listening", e)
         }
+    }
+
+    /**
+     * Open the microphone with as little of the phone's own processing as
+     * possible. The standard MIC source often applies noise suppression and
+     * automatic gain, and noise suppression is designed to remove steady
+     * tones, which is exactly what the trigger sound is.
+     *
+     * Order of preference:
+     *  1. UNPROCESSED, when the phone says it supports it (raw microphone).
+     *  2. VOICE_RECOGNITION (no noise suppression, little or no gain control
+     *     on most phones).
+     *  3. MIC, the previous behaviour, as a last resort.
+     */
+    private fun createAudioRecord(): AudioRecord? {
+        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+        val unprocessedSupported =
+            audioManager?.getProperty(AudioManager.PROPERTY_SUPPORT_AUDIO_SOURCE_UNPROCESSED) == "true"
+
+        val sources = mutableListOf<Pair<Int, String>>()
+        if (unprocessedSupported) sources.add(Pair(MediaRecorder.AudioSource.UNPROCESSED, "UNPROCESSED"))
+        sources.add(Pair(MediaRecorder.AudioSource.VOICE_RECOGNITION, "VOICE_RECOGNITION"))
+        sources.add(Pair(MediaRecorder.AudioSource.MIC, "MIC"))
+
+        for ((source, name) in sources) {
+            try {
+                val record = AudioRecord(source, SAMPLE_RATE, CHANNEL_CONFIG, AUDIO_FORMAT, bufferSize * 2)
+                if (record.state == AudioRecord.STATE_INITIALIZED) {
+                    Log.i(
+                        "TuneURL_DIAG",
+                        "OTA microphone source=$name (unprocessed supported=$unprocessedSupported)"
+                    )
+                    return record
+                }
+                record.release()
+                Log.w(TAG, "Microphone source $name could not be opened, trying the next one")
+            } catch (e: SecurityException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "Microphone source $name failed: ${e.message}")
+            }
+        }
+        return null
     }
 
     fun stopListening() {
@@ -281,6 +326,8 @@ class OTAListener(private val context: Context) : Constants {
         } catch (e: Exception) {
             Log.e(TAG, "Error stopping audio record", e)
         }
+
+        debugRecorder.stop()
 
         synchronized(bufferLock) {
             audioBuffer.clear()
@@ -349,6 +396,7 @@ class OTAListener(private val context: Context) : Constants {
                     if (bytesRead > 0) {
                         val chunk = buffer.copyOf(bytesRead)
                         addToBuffer(chunk)
+                        debugRecorder.write(chunk)
                     }
                 } catch (e: Exception) {
                     if (isListening) {
@@ -468,7 +516,12 @@ class OTAListener(private val context: Context) : Constants {
                 val (content, contentSamples) = resampleToFingerprintRate(contentPcm)
                     ?: return@withContext
 
-                val fingerprintBytes = TuneURLSDK.extractFingerprintFromBuffer(content, contentSamples)
+                // The match server expects V1. Pass it explicitly: the SDK-wide
+                // setting is V2 by default and only switched to V1 when the
+                // stream path starts, so microphone-only sessions used to send V2.
+                val fingerprintBytes = TuneURLSDK.extractFingerprintFromBufferAt(
+                    content, contentSamples, TuneURLSDK.FORMAT_VERSION_V1
+                )
                 if (fingerprintBytes != null) {
                     Log.d(TAG, "Fingerprint extracted: ${fingerprintBytes.size} bytes from $contentSamples samples")
                     val fingerprintString = fingerprintBytes.joinToString(",") {
@@ -536,11 +589,12 @@ class OTAListener(private val context: Context) : Constants {
         // unchanged so existing log filters keep working.
         Log.i(
             "TuneURL_DIAG",
-            "OTA local v2 similarity=%.4f (threshold=%.2f) triggerStart=%.2fs window=%.2fs positions=%d level=%.1fdBFS peak=%d%s"
+            "OTA local v2 similarity=%.4f (threshold=%.2f) triggerStart=%.2fs window=%.2fs positions=%d level=%.1fdBFS peak=%d pos=%.2fs%s"
                 .format(
                     similarity, TRIGGER_SIMILARITY_THRESHOLD,
                     if (similarity > 0f) triggerStartSeconds else -1.0,
-                    windowSeconds, match?.positionsChecked ?: 0, levelDb, peak, logSuffix
+                    windowSeconds, match?.positionsChecked ?: 0, levelDb, peak,
+                    endPos.toDouble() / BYTES_PER_SECOND, logSuffix
                 )
         )
         if (peak < SILENCE_PEAK) {
@@ -550,6 +604,124 @@ class OTAListener(private val context: Context) : Constants {
         if (match == null) return null
         val windowStartPos = endPos - pcmData.size
         return TriggerLook(similarity, windowStartPos + secondsToBytes(triggerStartSeconds))
+    }
+
+    private val debugRecorder = DebugWavRecorder()
+
+    /**
+     * DEBUG BUILDS ONLY: saves everything the microphone hears while listening
+     * to WAV files, so test sessions can be replayed through the detection
+     * code off the phone. Release builds never record (BuildConfig.DEBUG).
+     *
+     * Files go to the app's own external folder, which adb can read:
+     *   /sdcard/Android/data/com.tuneurlradio.app/files/ota-recordings/
+     * Copy them off with:
+     *   adb pull /sdcard/Android/data/com.tuneurlradio.app/files/ota-recordings
+     *
+     * Each listening session starts a new file named after its start time.
+     * A file is closed and a new one started every RECORDING_SPLIT_SECONDS so
+     * files stay a manageable size (10 minutes is about 53 MB). The
+     * TuneURL_DIAG lines carry pos=<seconds since listening started>, so a
+     * check at pos=P is at P - (part - 1) * RECORDING_SPLIT_SECONDS into file
+     * "..._partN.wav".
+     *
+     * The recording captures everything in the room: use it for test
+     * sessions only, and delete the files afterwards.
+     */
+    private inner class DebugWavRecorder {
+        private val RECORDING_SPLIT_SECONDS = 600
+        private val lock = Any()
+        private var file: RandomAccessFile? = null
+        private var fileName = ""
+        private var dataBytes = 0L
+        private var part = 0
+        private var sessionStamp = ""
+
+        fun start() {
+            if (!BuildConfig.DEBUG) return
+            synchronized(lock) {
+                closeLocked()
+                sessionStamp = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.US).format(Date())
+                part = 0
+                openNextLocked()
+            }
+        }
+
+        fun write(chunk: ByteArray) {
+            if (!BuildConfig.DEBUG) return
+            synchronized(lock) {
+                val f = file ?: return
+                try {
+                    f.write(chunk)
+                    dataBytes += chunk.size
+                    if (dataBytes >= RECORDING_SPLIT_SECONDS.toLong() * SAMPLE_RATE * 2) {
+                        closeLocked()
+                        openNextLocked()
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Debug recording write failed — recording stopped", e)
+                    closeLocked()
+                }
+            }
+        }
+
+        fun stop() {
+            if (!BuildConfig.DEBUG) return
+            synchronized(lock) { closeLocked() }
+        }
+
+        private fun openNextLocked() {
+            try {
+                val dir = context.getExternalFilesDir("ota-recordings") ?: return
+                if (!dir.exists()) dir.mkdirs()
+                part += 1
+                fileName = "ota_${sessionStamp}_part$part.wav"
+                val f = RandomAccessFile(File(dir, fileName), "rw")
+                f.setLength(0)
+                f.write(wavHeader(0))   // sizes are filled in when the file is closed
+                file = f
+                dataBytes = 0
+                Log.i("TuneURL_DIAG", "OTA debug recording started file=$fileName (${dir.absolutePath})")
+            } catch (e: Exception) {
+                Log.e(TAG, "Could not start debug recording", e)
+                file = null
+            }
+        }
+
+        private fun closeLocked() {
+            val f = file ?: return
+            try {
+                f.seek(0)
+                f.write(wavHeader(dataBytes))
+                f.close()
+                Log.i(
+                    "TuneURL_DIAG",
+                    "OTA debug recording saved file=$fileName seconds=%.1f".format(dataBytes.toDouble() / (SAMPLE_RATE * 2))
+                )
+            } catch (e: Exception) {
+                Log.e(TAG, "Could not finish debug recording", e)
+            }
+            file = null
+        }
+
+        /** 44-byte header for 16-bit mono PCM at SAMPLE_RATE. */
+        private fun wavHeader(dataSize: Long): ByteArray {
+            val header = ByteBuffer.allocate(44).order(ByteOrder.LITTLE_ENDIAN)
+            header.put("RIFF".toByteArray(Charsets.US_ASCII))
+            header.putInt((36 + dataSize).toInt())
+            header.put("WAVE".toByteArray(Charsets.US_ASCII))
+            header.put("fmt ".toByteArray(Charsets.US_ASCII))
+            header.putInt(16)                 // fmt chunk size
+            header.putShort(1)                // PCM
+            header.putShort(1)                // mono
+            header.putInt(SAMPLE_RATE)
+            header.putInt(SAMPLE_RATE * 2)    // bytes per second
+            header.putShort(2)                // bytes per sample frame
+            header.putShort(16)               // bits per sample
+            header.put("data".toByteArray(Charsets.US_ASCII))
+            header.putInt(dataSize.toInt())
+            return header.array()
+        }
     }
 
     // Below this peak (of 32767) the microphone is treated as silent.
